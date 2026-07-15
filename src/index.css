@@ -1,0 +1,23 @@
+@import "tailwindcss";
+
+@layer base {
+  html {
+    color-scheme: light;
+  }
+  body {
+    @apply bg-zinc-50 text-zinc-900 antialiased;
+  }
+}
+
+/* Ensure no dark-on-dark text in any dialogue or popup */
+.text-zinc-900 { color: #18181b; }
+.text-zinc-800 { color: #27272a; }
+.bg-zinc-900 { background-color: #18181b; }
+.text-white { color: #ffffff; }
+
+/* Force chat bubbles to high contrast */
+.bg-zinc-900 .text-zinc-800 { color: #ffffff !important; }
+.bg-zinc-900 .text-zinc-400 { color: #a1a1aa !important; }
+
+/* Calibration live log: keep prior UI but make diagnostic output reviewable. */
+.z-\[9999\] .max-h-56 { max-height: 28rem; }

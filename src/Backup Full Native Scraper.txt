@@ -1,0 +1,3489 @@
+FULL Updated Scraper Codebase:
+
+COMPLETION STATUS: ALL FILES OUTPUT
+
+File	Status
+vite-native-knowledge-store.ts	✅ 
+vite-native-runtime-plane.ts	✅ 
+vite-native-policy-plane.ts	✅ 
+vite-native-contract-plane.ts	✅ 
+vite-native-replay-plane.ts	✅
+vite-native-snapshot-plane.ts	✅ 
+vite-native-doctor-plane.ts	✅ 
+vite-native-selftest.ts	✅ 
+vite-native-selftest-functional.ts	✅ 
+vite-native-chaos-harness.ts	✅ 
+vite-native-scraper.ts	✅ 
+
+src/lib/overrides/vite-native-runtime-plane.ts
+TypeScript
+
+import { channel } from 'node:diagnostics_channel';
+import { monitorEventLoopDelay } from 'node:perf_hooks';
+
+export type RuntimePressure = 'ok' | 'warm' | 'hot';
+
+export interface RuntimeEvent {
+  ts: number;
+  iso: string;
+  type: string;
+  payload?: unknown;
+}
+
+export interface RuntimeStats {
+  pressure: RuntimePressure;
+  eventLoop: {
+    meanMs: number;
+    maxMs: number;
+    minMs: number;
+    stddevMs: number;
+  };
+  memory: {
+    rss: number;
+    heapUsed: number;
+    heapTotal: number;
+    external: number;
+    arrayBuffers: number;
+  };
+  uptimeSec: number;
+  recentEventCount: number;
+}
+
+const runtimeChannel = channel('vite-native-scraper.runtime');
+const lag = monitorEventLoopDelay({ resolution: 20 });
+lag.enable();
+
+const MAX_EVENTS = 500;
+const recentEvents: RuntimeEvent[] = [];
+
+const lagResetTimer = setInterval(() => {
+  try { lag.reset(); } catch {}
+}, 60_000);
+(lagResetTimer as any).unref?.();
+
+export function emitRuntimeEvent(type: string, payload?: unknown): void {
+  const ev: RuntimeEvent = {
+    ts: Date.now(),
+    iso: new Date().toISOString(),
+    type,
+    payload,
+  };
+
+  recentEvents.push(ev);
+  if (recentEvents.length > MAX_EVENTS) {
+    recentEvents.splice(0, recentEvents.length - MAX_EVENTS);
+  }
+
+  if ((runtimeChannel as any).hasSubscribers) {
+    try { runtimeChannel.publish(ev); } catch {}
+  }
+}
+
+export function listRuntimeEvents(opts?: { limit?: number; type?: string }): RuntimeEvent[] {
+  const limit = Math.max(1, Math.min(500, Math.trunc(opts?.limit ?? 100)));
+  const type = opts?.type?.trim();
+
+  const arr = type ? recentEvents.filter((e) => e.type === type) : recentEvents;
+  return arr.slice(-limit);
+}
+
+export function getRuntimeStats(): RuntimeStats {
+  const mem = process.memoryUsage();
+
+  const meanMs = Number((lag as any).mean || 0) / 1e6;
+  const maxMs = Number((lag as any).max || 0) / 1e6;
+  const minMs = Number((lag as any).min || 0) / 1e6;
+  const stddevMs = Number((lag as any).stddev || 0) / 1e6;
+
+  const pressure: RuntimePressure =
+    maxMs > 250 || mem.rss > 1_073_741_824
+      ? 'hot'
+      : maxMs > 80 || mem.rss > 536_870_912
+        ? 'warm'
+        : 'ok';
+
+  return {
+    pressure,
+    eventLoop: {
+      meanMs,
+      maxMs,
+      minMs,
+      stddevMs,
+    },
+    memory: {
+      rss: mem.rss,
+      heapUsed: mem.heapUsed,
+      heapTotal: mem.heapTotal,
+      external: mem.external,
+      arrayBuffers: mem.arrayBuffers,
+    },
+    uptimeSec: process.uptime(),
+    recentEventCount: recentEvents.length,
+  };
+}
+
+export function shouldDeferBackgroundWork(
+  kind: 'prefetch' | 'watcher' | 'refresh' | 'prewarm',
+): boolean {
+  const s = getRuntimeStats();
+  if (s.pressure === 'hot') return true;
+  if (s.pressure === 'warm') return kind === 'prefetch' || kind === 'prewarm';
+  return false;
+}
+src/lib/overrides/vite-native-policy-plane.ts
+TypeScript
+
+import { createRequire } from 'node:module';
+import * as path from 'node:path';
+import * as fs from 'node:fs';
+import { channel } from 'node:diagnostics_channel';
+
+export interface PolicyState {
+  useDdg: boolean;
+  useBing: boolean;
+  useYahoo: boolean;
+  useMojeek: boolean;
+  enableSSE: boolean;
+  enableAutoRag: boolean;
+  enablePrefetch: boolean;
+  enableConditionalGet: boolean;
+  enableRagEarlyExit: boolean;
+  enableTrigramRecall: boolean;
+  enableDomainCap: boolean;
+  enableWatcherBackgroundFlush: boolean;
+}
+
+export interface PolicyContext {
+  pressure?: 'ok' | 'warm' | 'hot';
+  engineHealth?: Record<string, { rate?: number; drift?: boolean }>;
+  selfTestCriticalFailed?: number;
+}
+
+const DEFAULT_POLICY: PolicyState = {
+  useDdg: true,
+  useBing: true,
+  useYahoo: true,
+  useMojeek: true,
+  enableSSE: true,
+  enableAutoRag: true,
+  enablePrefetch: true,
+  enableConditionalGet: true,
+  enableRagEarlyExit: true,
+  enableTrigramRecall: true,
+  enableDomainCap: true,
+  enableWatcherBackgroundFlush: true,
+};
+
+let DatabaseSync: any = null;
+let dbAvailable = false;
+
+try {
+  const anyProc: any = globalThis.process as any;
+  if (anyProc && typeof anyProc.getBuiltinModule === 'function') {
+    const mod = anyProc.getBuiltinModule('node:sqlite');
+    if (mod?.DatabaseSync) {
+      DatabaseSync = mod.DatabaseSync;
+      dbAvailable = true;
+    }
+  }
+} catch {}
+
+if (!dbAvailable) {
+  try {
+    const req = createRequire(import.meta.url);
+    ({ DatabaseSync } = req('node:sqlite'));
+    dbAvailable = !!DatabaseSync;
+  } catch {
+    dbAvailable = false;
+  }
+}
+
+const DB_DIR = path.resolve(process.cwd(), 'src/audit');
+const DB_PATH = path.join(DB_DIR, 'knowledge.db');
+
+let db: any = null;
+let initFailed = false;
+
+const policyChannel = channel('vite-native-scraper.policy');
+
+function emitPolicyEvent(type: string, payload?: unknown): void {
+  if ((policyChannel as any).hasSubscribers) {
+    try { policyChannel.publish({ ts: Date.now(), type, payload }); } catch {}
+  }
+}
+
+function ensureDbDir() {
+  if (!fs.existsSync(DB_DIR)) fs.mkdirSync(DB_DIR, { recursive: true });
+}
+
+function getDb(): any {
+  if (!dbAvailable || initFailed) return null;
+  if (db) return db;
+
+  try {
+    ensureDbDir();
+    db = new DatabaseSync(DB_PATH);
+
+    try { db.exec(`PRAGMA journal_mode = WAL`); } catch {}
+    try { db.exec(`PRAGMA synchronous = NORMAL`); } catch {}
+    try { db.exec(`PRAGMA busy_timeout = 3000`); } catch {}
+
+    db.exec(`
+      CREATE TABLE IF NOT EXISTS policy_flags (
+        name TEXT PRIMARY KEY,
+        valueJson TEXT NOT NULL,
+        ts INTEGER NOT NULL
+      ) STRICT
+    `);
+
+    return db;
+  } catch {
+    initFailed = true;
+    return null;
+  }
+}
+
+export function getPolicyOverrides(): Partial<PolicyState> {
+  const conn = getDb();
+  if (!conn) return {};
+
+  try {
+    const rows = conn.prepare(
+      'SELECT name, valueJson FROM policy_flags ORDER BY ts DESC',
+    ).all() as Array<{ name: string; valueJson: string }>;
+
+    const out: Partial<PolicyState> = {};
+    for (const row of rows) {
+      try {
+        (out as any)[row.name] = JSON.parse(row.valueJson);
+      } catch {}
+    }
+    return out;
+  } catch {
+    return {};
+  }
+}
+
+export function setPolicyOverride<K extends keyof PolicyState>(key: K, value: PolicyState[K]): boolean {
+  const conn = getDb();
+  if (!conn) return false;
+
+  try {
+    conn.prepare(`
+      INSERT INTO policy_flags (name, valueJson, ts)
+      VALUES (?, ?, ?)
+      ON CONFLICT(name) DO UPDATE SET
+        valueJson = excluded.valueJson,
+        ts = excluded.ts
+    `).run(String(key), JSON.stringify(value), Date.now());
+
+    emitPolicyEvent('policy.override.set', { key, value });
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+export function clearPolicyOverride<K extends keyof PolicyState>(key: K): boolean {
+  const conn = getDb();
+  if (!conn) return false;
+
+  try {
+    conn.prepare(`DELETE FROM policy_flags WHERE name = ?`).run(String(key));
+    emitPolicyEvent('policy.override.clear', { key });
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+export function evaluatePolicy(ctx?: PolicyContext): PolicyState {
+  const base: PolicyState = {
+    ...DEFAULT_POLICY,
+    ...getPolicyOverrides(),
+  };
+
+  const pressure = ctx?.pressure ?? 'ok';
+  const health = ctx?.engineHealth ?? {};
+  const criticalFails = ctx?.selfTestCriticalFailed ?? 0;
+
+  if (pressure === 'hot') {
+    base.enablePrefetch = false;
+    base.enableSSE = false;
+    base.enableAutoRag = false;
+    base.enableWatcherBackgroundFlush = false;
+  } else if (pressure === 'warm') {
+    base.enablePrefetch = false;
+  }
+
+  if (health.ddg?.drift) base.useDdg = false;
+  if (health.bing?.drift) base.useBing = false;
+  if (health.yahoo?.drift) base.useYahoo = false;
+  if (health.mojeek?.drift) base.useMojeek = false;
+
+  if (criticalFails > 0) {
+    base.enablePrefetch = false;
+    base.enableSSE = false;
+    base.enableAutoRag = false;
+  }
+
+  if (!base.useDdg && !base.useBing && !base.useYahoo && !base.useMojeek) {
+    base.useDdg = true;
+  }
+
+  return base;
+}
+
+export function applySelfTestRemediation(result: { checks?: Array<{ id: string; pass: boolean }> }): void {
+  const checks = result?.checks || [];
+  const failed = new Set(checks.filter((c) => !c.pass).map((c) => c.id));
+
+  if (failed.has('parser.bing.href.capture') || failed.has('parser.bing.href.good')) {
+    void setPolicyOverride('useBing', false);
+  }
+  if (failed.has('parser.mojeek.href.capture') || failed.has('parser.mojeek.href.good')) {
+    void setPolicyOverride('useMojeek', false);
+  }
+}
+
+export function describePolicy(ctx?: PolicyContext): {
+  defaults: PolicyState;
+  overrides: Partial<PolicyState>;
+  effective: PolicyState;
+} {
+  const overrides = getPolicyOverrides();
+  return {
+    defaults: { ...DEFAULT_POLICY },
+    overrides,
+    effective: evaluatePolicy(ctx),
+  };
+}
+src/lib/overrides/vite-native-contract-plane.ts
+TypeScript
+
+export interface ProblemType {
+  type: string;
+  title: string;
+  status: number;
+  detail: string;
+}
+
+export const PROBLEM_TYPES: Record<string, ProblemType> = {
+  missing_query: {
+    type: 'https://arena.local/problems/missing-query',
+    title: 'Missing query',
+    status: 400,
+    detail: 'A required query parameter was not provided.',
+  },
+  ssrf_blocked: {
+    type: 'https://arena.local/problems/ssrf-blocked',
+    title: 'Blocked outbound target',
+    status: 400,
+    detail: 'The outbound URL was rejected by SSRF or protocol validation.',
+  },
+  rate_limited: {
+    type: 'https://arena.local/problems/rate-limited',
+    title: 'Rate limited',
+    status: 429,
+    detail: 'The request was rejected by the inbound token-bucket or anti-loop guard.',
+  },
+  upstream_failed: {
+    type: 'https://arena.local/problems/upstream-failed',
+    title: 'Upstream fetch failed',
+    status: 502,
+    detail: 'The direct fetch and/or fallback proxy fetch failed.',
+  },
+  not_found: {
+    type: 'https://arena.local/problems/not-found',
+    title: 'Resource not found',
+    status: 404,
+    detail: 'The requested resource was not found.',
+  },
+  internal_error: {
+    type: 'https://arena.local/problems/internal-error',
+    title: 'Internal error',
+    status: 500,
+    detail: 'An unexpected internal error occurred.',
+  },
+};
+
+function str(desc: string) { return { type: 'string', description: desc }; }
+function int(desc: string, min?: number, max?: number) {
+  return {
+    type: 'integer',
+    description: desc,
+    ...(min !== undefined ? { minimum: min } : {}),
+    ...(max !== undefined ? { maximum: max } : {}),
+  };
+}
+function bool(desc: string) { return { type: 'boolean', description: desc }; }
+function queryParam(name: string, schema: any, required = false) {
+  return { name, in: 'query', required, schema };
+}
+function getOperation(summary: string, params: any[] = [], responseDesc = 'OK') {
+  return {
+    summary,
+    parameters: params,
+    responses: {
+      '200': {
+        description: responseDesc,
+        content: {
+          'application/json': {
+            schema: { type: 'object', additionalProperties: true },
+          },
+        },
+      },
+      '400': { $ref: '#/components/responses/Problem' },
+      '429': { $ref: '#/components/responses/Problem' },
+      '500': { $ref: '#/components/responses/Problem' },
+    },
+  };
+}
+
+export function getNativeOpenApiDocument(baseUrl = 'http://localhost:5173') {
+  return {
+    openapi: '3.1.0',
+    jsonSchemaDialect: 'https://json-schema.org/draft/2020-12/schema',
+    info: {
+      title: 'PrismaReact Native Scraper & Knowledge Gateway',
+      version: 'terminal',
+      description:
+        'Native Vite middleware API for SSRF-safe metasearch, reads, persistent RAG, audit, runtime control, self-tests, and contract discovery.',
+    },
+    servers: [{ url: baseUrl }],
+    tags: [
+      { name: 'retrieval' },
+      { name: 'read' },
+      { name: 'knowledge' },
+      { name: 'governance' },
+      { name: 'runtime' },
+      { name: 'policy' },
+      { name: 'replay' },
+      { name: 'snapshot' },
+      { name: 'contract' },
+      { name: 'doctor' },
+    ],
+    paths: {
+      '/api/native-search': { get: { tags: ['retrieval'], ...getOperation('Multi-engine metasearch', [queryParam('q', str('Search query'), true), queryParam('count', int('Maximum results', 1, 20)), queryParam('tokenBudget', int('Optional response token budget')), queryParam('nocache', bool('Bypass warm paths'))]) } },
+      '/api/native-search/stream': { get: { tags: ['retrieval'], ...getOperation('SSE streaming search', [queryParam('q', str('Search query'), true), queryParam('count', int('Maximum results', 1, 20))], 'SSE stream') } },
+      '/api/native-search/explain': { get: { tags: ['retrieval'], ...getOperation('Explain ranking', [queryParam('q', str('Search query'), true), queryParam('count', int('Maximum results', 1, 20))]) } },
+      '/api/native-search/plan': { get: { tags: ['retrieval'], ...getOperation('Return query-plan trace', [queryParam('q', str('Search query'), true), queryParam('count', int('Maximum results', 1, 20))]) } },
+      '/api/native-search/health': { get: { tags: ['runtime'], ...getOperation('Engine health telemetry') } },
+      '/api/native-search/ctr-stats': { get: { tags: ['runtime'], ...getOperation('CTR statistics') } },
+      '/api/native-search/proof': { get: { tags: ['governance'], ...getOperation('Generate query proof receipt', [queryParam('q', str('Search query'), true)]) } },
+      '/api/native-search/batch': { get: { tags: ['retrieval'], ...getOperation('Run up to 5 queries in one call', [queryParam('q', str('Repeated query param, up to 5')), queryParam('count', int('Maximum merged results', 1, 20))]) } },
+
+      '/api/native-read': { get: { tags: ['read'], ...getOperation('Fetch and strip URL to plain text', [queryParam('url', str('Target URL'), true), queryParam('redact', bool('Redact PII in returned text')), queryParam('conditional', bool('Use conditional GET cache'))]) } },
+
+      '/api/native-ingest': { get: { tags: ['knowledge'], ...getOperation('Ingest workspace file from /src', [queryParam('path', str('Workspace path under src/'), true)]) } },
+      '/api/native-ingest/bulk': { get: { tags: ['knowledge'], ...getOperation('Bulk ingest a directory under /src', [queryParam('path', str('Workspace directory under src/')), queryParam('dryRun', bool('Preview only'))]) } },
+
+      '/api/native-knowledge/query': { get: { tags: ['knowledge'], ...getOperation('Query knowledge store', [queryParam('q', str('Knowledge query'), true), queryParam('limit', int('Maximum hits', 1, 50)), queryParam('as_of', int('Time-travel timestamp'))]) } },
+      '/api/native-knowledge/similar': { get: { tags: ['knowledge'], ...getOperation('SimHash near-duplicate recall', [queryParam('text', str('Input text')), queryParam('q', str('Alias for text')), queryParam('maxDistance', int('Max Hamming distance')), queryParam('limit', int('Maximum hits', 1, 50))]) } },
+      '/api/native-knowledge/trigram': { get: { tags: ['knowledge'], ...getOperation('Character trigram TF-IDF recall', [queryParam('q', str('Trigram query'), true), queryParam('limit', int('Maximum hits', 1, 50))]) } },
+      '/api/native-knowledge/synthesize': { get: { tags: ['knowledge'], ...getOperation('Synthesize known context about a topic', [queryParam('q', str('Topic'), true), queryParam('maxChars', int('Maximum synthesis chars')), queryParam('maxHits', int('Maximum hits'))]) } },
+      '/api/native-knowledge/context-cloud': { get: { tags: ['knowledge'], ...getOperation('Traverse code graph from a file', [queryParam('ref', str('File reference'), true), queryParam('depth', int('Graph depth', 1, 3)), queryParam('maxTotalHits', int('Maximum hits'))]) } },
+      '/api/native-knowledge/timeline': { get: { tags: ['knowledge'], ...getOperation('Return episodic session timeline', [queryParam('session', str('Session id'))]) } },
+      '/api/native-knowledge/graph': { get: { tags: ['knowledge'], ...getOperation('Query code dependency graph', [queryParam('ref', str('File ref'), true), queryParam('direction', str('"deps" or "dependents"'))]) } },
+      '/api/native-knowledge/symbols': { get: { tags: ['knowledge'], ...getOperation('Search extracted code symbols', [queryParam('q', str('Symbol query')), queryParam('file', str('File to list symbols from')), queryParam('kind', str('Symbol kind')), queryParam('exported', bool('Only exported symbols'))]) } },
+      '/api/native-knowledge/digest': { get: { tags: ['governance'], ...getOperation('Merkle-lite digest of knowledge corpus') } },
+      '/api/native-knowledge/stats': { get: { tags: ['knowledge'], ...getOperation('Knowledge store stats') } },
+      '/api/native-knowledge/failures': { get: { tags: ['runtime'], ...getOperation('Failure memory statistics') } },
+      '/api/native-knowledge/export': { get: { tags: ['knowledge'], ...getOperation('NDJSON export of knowledge entries', [queryParam('kind', str('Optional kind filter'))], 'NDJSON stream') } },
+      '/api/native-knowledge/index-health': { get: { tags: ['governance'], ...getOperation('FTS5 index health') } },
+      '/api/native-knowledge/repair-index': { get: { tags: ['governance'], ...getOperation('Repair FTS5 index drift') } },
+      '/api/native-knowledge/sync': { get: { tags: ['governance'], ...getOperation('Ghost-file autophagy sync') } },
+
+      '/api/native-scratchpad/get': { get: { tags: ['knowledge'], ...getOperation('Get scratchpad key', [queryParam('key', str('Scratchpad key'), true)]) } },
+      '/api/native-scratchpad/set': { get: { tags: ['knowledge'], ...getOperation('Set scratchpad key', [queryParam('key', str('Scratchpad key'), true), queryParam('value', str('Scratchpad value'), true)]) } },
+      '/api/native-scratchpad/delete': { get: { tags: ['knowledge'], ...getOperation('Delete scratchpad key', [queryParam('key', str('Scratchpad key'), true)]) } },
+      '/api/native-scratchpad/list': { get: { tags: ['knowledge'], ...getOperation('List scratchpad keys') } },
+
+      '/api/native-events': { get: { tags: ['runtime'], ...getOperation('Multi-client SSE event bus', [], 'SSE stream') } },
+      '/api/native-runtime/stats': { get: { tags: ['runtime'], ...getOperation('Runtime event-loop and memory stats') } },
+      '/api/native-runtime/events': { get: { tags: ['runtime'], ...getOperation('Recent runtime diagnostic events', [queryParam('limit', int('Maximum events', 1, 500)), queryParam('type', str('Filter by event type'))]) } },
+
+      '/api/native-policy': { get: { tags: ['policy'], ...getOperation('Show effective policy, defaults, and overrides') } },
+      '/api/native-policy/set': { get: { tags: ['policy'], ...getOperation('Set policy override', [queryParam('key', str('Policy key'), true), queryParam('value', str('Policy value'), true)]) } },
+      '/api/native-policy/clear': { get: { tags: ['policy'], ...getOperation('Clear policy override', [queryParam('key', str('Policy key'), true)]) } },
+
+      '/api/native-replay/list': { get: { tags: ['replay'], ...getOperation('List replay entries') } },
+      '/api/native-replay/get': { get: { tags: ['replay'], ...getOperation('Get replay entry', [queryParam('id', int('Replay id'), true)]) } },
+      '/api/native-replay/run': { get: { tags: ['replay'], ...getOperation('Replay a stored request', [queryParam('id', int('Replay id'), true)]) } },
+
+      '/api/native-snapshot/manifest': { get: { tags: ['snapshot'], ...getOperation('Snapshot manifest') } },
+      '/api/native-snapshot/list': { get: { tags: ['snapshot'], ...getOperation('List hot backups', [queryParam('limit', int('Maximum backups', 1, 500))]) } },
+      '/api/native-snapshot/backup': { get: { tags: ['snapshot'], ...getOperation('Create hot backup', [queryParam('label', str('Optional label'))]) } },
+      '/api/native-snapshot/changeset': { get: { tags: ['snapshot'], ...getOperation('Export changeset/patchset', [queryParam('mode', str('"changeset" or "patchset"'))]) } },
+      '/api/native-snapshot/reset-session': { get: { tags: ['snapshot'], ...getOperation('Reset changeset session window') } },
+
+      '/api/native-selftest': { get: { tags: ['contract'], ...getOperation('Static source contract sentinel') } },
+      '/api/native-selftest/functional': { get: { tags: ['contract'], ...getOperation('Functional golden-fixture self-test', [queryParam('rw', bool('Enable scratchpad write roundtrip'))]) } },
+      '/api/native-chaos': { get: { tags: ['contract'], ...getOperation('Deterministic property-style chaos harness', [queryParam('seed', int('Deterministic seed')), queryParam('iterations', int('Iterations', 1, 500))]) } },
+      '/api/native-help': { get: { tags: ['contract'], ...getOperation('Human-readable native API manifest') } },
+      '/api/native-openapi.json': { get: { tags: ['contract'], ...getOperation('OpenAPI 3.1 machine contract') } },
+      '/api/native-problems': { get: { tags: ['contract'], ...getOperation('RFC 9457 problem catalog') } },
+      '/api/native-contract/selftest': { get: { tags: ['contract'], ...getOperation('Contract-plane self-test') } },
+
+      '/api/native-doctor': { get: { tags: ['doctor'], ...getOperation('One-shot composed backend health briefing', [queryParam('deep', bool('Run functional self-test too'))]) } },
+
+      '/api/audit/verify': { get: { tags: ['governance'], ...getOperation('Verify SHA-256 audit ledger hash chain') } },
+      '/api/audit/seal': { get: { tags: ['governance'], ...getOperation('Cryptographically seal current audit root') } },
+    },
+    components: {
+      schemas: {
+        Problem: {
+          type: 'object',
+          required: ['type', 'title', 'status'],
+          properties: {
+            type: { type: 'string', format: 'uri' },
+            title: { type: 'string' },
+            status: { type: 'integer' },
+            detail: { type: 'string' },
+            instance: { type: 'string' },
+          },
+          additionalProperties: true,
+        },
+      },
+      responses: {
+        Problem: {
+          description: 'RFC 9457 problem response',
+          content: {
+            'application/problem+json': {
+              schema: { $ref: '#/components/schemas/Problem' },
+            },
+            'application/json': {
+              schema: { $ref: '#/components/schemas/Problem' },
+            },
+          },
+        },
+      },
+    },
+  };
+}
+
+export function getProblemCatalog() {
+  return {
+    problems: Object.values(PROBLEM_TYPES),
+    mediaType: 'application/problem+json',
+    backend: 'native-contract-plane',
+  };
+}
+
+export function contractSelfTest() {
+  const doc = getNativeOpenApiDocument();
+  const checks = [
+    { id: 'openapi.version', pass: doc.openapi === '3.1.0', message: 'OpenAPI version must be 3.1.0.' },
+    { id: 'openapi.search', pass: !!doc.paths['/api/native-search'], message: 'Search route must be present.' },
+    { id: 'openapi.read', pass: !!doc.paths['/api/native-read'], message: 'Read route must be present.' },
+    { id: 'openapi.audit', pass: !!doc.paths['/api/audit/verify'], message: 'Audit verify route must be present.' },
+    { id: 'problem.catalog', pass: Object.keys(PROBLEM_TYPES).length >= 5, message: 'Problem catalog must include core error types.' },
+  ];
+  return {
+    ok: checks.every((c) => c.pass),
+    checkedAt: new Date().toISOString(),
+    checks,
+  };
+}
+src/lib/overrides/vite-native-replay-plane.ts
+TypeScript
+
+import { createRequire } from 'node:module';
+import * as path from 'node:path';
+import * as fs from 'node:fs';
+import * as crypto from 'node:crypto';
+
+let DatabaseSync: any = null;
+let dbAvailable = false;
+
+try {
+  const anyProc: any = globalThis.process as any;
+  if (anyProc && typeof anyProc.getBuiltinModule === 'function') {
+    const mod = anyProc.getBuiltinModule('node:sqlite');
+    if (mod?.DatabaseSync) {
+      DatabaseSync = mod.DatabaseSync;
+      dbAvailable = true;
+    }
+  }
+} catch {}
+
+if (!dbAvailable) {
+  try {
+    const req = createRequire(import.meta.url);
+    ({ DatabaseSync } = req('node:sqlite'));
+    dbAvailable = !!DatabaseSync;
+  } catch {
+    dbAvailable = false;
+  }
+}
+
+const DB_DIR = path.resolve(process.cwd(), 'src/audit');
+const DB_PATH = path.join(DB_DIR, 'knowledge.db');
+
+let db: any = null;
+let initFailed = false;
+
+function ensureDbDir() {
+  if (!fs.existsSync(DB_DIR)) fs.mkdirSync(DB_DIR, { recursive: true });
+}
+
+function getDb(): any {
+  if (!dbAvailable || initFailed) return null;
+  if (db) return db;
+
+  try {
+    ensureDbDir();
+    db = new DatabaseSync(DB_PATH);
+    try { db.exec(`PRAGMA journal_mode = WAL`); } catch {}
+    try { db.exec(`PRAGMA synchronous = NORMAL`); } catch {}
+    try { db.exec(`PRAGMA busy_timeout = 3000`); } catch {}
+
+    db.exec(`
+      CREATE TABLE IF NOT EXISTS replay_log (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        route TEXT NOT NULL,
+        requestJson TEXT NOT NULL,
+        responseJson TEXT NOT NULL,
+        statusCode INTEGER NOT NULL,
+        ok INTEGER NOT NULL,
+        durationMs REAL NOT NULL,
+        ts INTEGER NOT NULL,
+        note TEXT
+      ) STRICT
+    `);
+
+    db.exec(`CREATE INDEX IF NOT EXISTS idx_replay_route ON replay_log(route)`);
+    db.exec(`CREATE INDEX IF NOT EXISTS idx_replay_ts ON replay_log(ts)`);
+
+    return db;
+  } catch {
+    initFailed = true;
+    return null;
+  }
+}
+
+export interface ReplayEntry {
+  id: number;
+  route: string;
+  requestJson: string;
+  responseJson: string;
+  statusCode: number;
+  ok: boolean;
+  durationMs: number;
+  ts: number;
+  note?: string;
+}
+
+export function recordReplay(
+  route: string,
+  request: unknown,
+  response: unknown,
+  statusCode = 200,
+  ok = true,
+  durationMs = 0,
+  note?: string,
+): number | null {
+  const conn = getDb();
+  if (!conn) return null;
+
+  try {
+    const stmt = conn.prepare(`
+      INSERT INTO replay_log
+      (route, requestJson, responseJson, statusCode, ok, durationMs, ts, note)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+    `);
+
+    const result = stmt.run(
+      route,
+      JSON.stringify(request),
+      JSON.stringify(response),
+      statusCode,
+      ok ? 1 : 0,
+      Number.isFinite(durationMs) ? durationMs : 0,
+      Date.now(),
+      note ?? null,
+    );
+
+    try {
+      const row = conn.prepare(`SELECT COUNT(*) AS c FROM replay_log`).get() as { c: number };
+      if ((row?.c ?? 0) > 5000) {
+        conn.prepare(`
+          DELETE FROM replay_log
+          WHERE id IN (
+            SELECT id FROM replay_log ORDER BY ts ASC LIMIT 1000
+          )
+        `).run();
+      }
+    } catch {}
+
+    return Number(result?.lastInsertRowid ?? 0) || null;
+  } catch {
+    return null;
+  }
+}
+
+export function listReplays(limit = 50, route?: string): ReplayEntry[] {
+  const conn = getDb();
+  if (!conn) return [];
+
+  const safeLimit = Math.max(1, Math.min(500, Math.trunc(limit) || 50));
+
+  try {
+    if (route && route.trim()) {
+      return conn.prepare(`
+        SELECT id, route, requestJson, responseJson, statusCode, ok, durationMs, ts, note
+        FROM replay_log
+        WHERE route = ?
+        ORDER BY ts DESC
+        LIMIT ?
+      `).all(route.trim(), safeLimit).map((r: any) => ({
+        ...r,
+        ok: !!r.ok,
+      })) as ReplayEntry[];
+    }
+
+    return conn.prepare(`
+      SELECT id, route, requestJson, responseJson, statusCode, ok, durationMs, ts, note
+      FROM replay_log
+      ORDER BY ts DESC
+      LIMIT ?
+    `).all(safeLimit).map((r: any) => ({
+      ...r,
+      ok: !!r.ok,
+    })) as ReplayEntry[];
+  } catch {
+    return [];
+  }
+}
+
+export function getReplay(id: number): ReplayEntry | null {
+  const conn = getDb();
+  if (!conn) return null;
+
+  try {
+    const row = conn.prepare(`
+      SELECT id, route, requestJson, responseJson, statusCode, ok, durationMs, ts, note
+      FROM replay_log
+      WHERE id = ?
+      LIMIT 1
+    `).get(id) as any;
+
+    if (!row) return null;
+
+    return { ...row, ok: !!row.ok } as ReplayEntry;
+  } catch {
+    return null;
+  }
+}
+
+export function summarizeReplayDiff(
+  stored: any,
+  current: any,
+): {
+  equal: boolean;
+  storedHash: string;
+  currentHash: string;
+  changedTopLevelKeys: string[];
+  resultCount?: { stored: number; current: number };
+  firstUrls?: { stored: string[]; current: string[] };
+} {
+  const stable = (v: any) => JSON.stringify(v);
+  const hash = (s: string) =>
+    crypto.createHash('sha256').update(s).digest('hex');
+
+  const storedStr = stable(stored);
+  const currentStr = stable(current);
+
+  const storedObj = stored && typeof stored === 'object' ? stored : {};
+  const currentObj = current && typeof current === 'object' ? current : {};
+
+  const allKeys = new Set([...Object.keys(storedObj), ...Object.keys(currentObj)]);
+
+  const changedTopLevelKeys = [...allKeys].filter((k) => {
+    try {
+      return JSON.stringify(storedObj[k]) !== JSON.stringify(currentObj[k]);
+    } catch {
+      return true;
+    }
+  });
+
+  const out: ReturnType<typeof summarizeReplayDiff> = {
+    equal: storedStr === currentStr,
+    storedHash: hash(storedStr),
+    currentHash: hash(currentStr),
+    changedTopLevelKeys,
+  };
+
+  if (Array.isArray(storedObj.results) || Array.isArray(currentObj.results)) {
+    out.resultCount = {
+      stored: Array.isArray(storedObj.results) ? storedObj.results.length : 0,
+      current: Array.isArray(currentObj.results) ? currentObj.results.length : 0,
+    };
+
+    out.firstUrls = {
+      stored: Array.isArray(storedObj.results)
+        ? storedObj.results.slice(0, 5).map((r: any) => r?.url).filter(Boolean)
+        : [],
+      current: Array.isArray(currentObj.results)
+        ? currentObj.results.slice(0, 5).map((r: any) => r?.url).filter(Boolean)
+        : [],
+    };
+  }
+
+  return out;
+}
+src/lib/overrides/vite-native-snapshot-plane.ts
+TypeScript
+
+import { createRequire } from 'node:module';
+import * as path from 'node:path';
+import * as fs from 'node:fs';
+import * as crypto from 'node:crypto';
+
+let DatabaseSync: any = null;
+let sqliteBackup: any = null;
+let dbAvailable = false;
+
+try {
+  const anyProc: any = globalThis.process as any;
+  if (anyProc && typeof anyProc.getBuiltinModule === 'function') {
+    const mod = anyProc.getBuiltinModule('node:sqlite');
+    if (mod) {
+      DatabaseSync = mod.DatabaseSync;
+      sqliteBackup = mod.backup;
+      dbAvailable = !!DatabaseSync;
+    }
+  }
+} catch {}
+
+if (!dbAvailable) {
+  try {
+    const req = createRequire(import.meta.url);
+    const mod = req('node:sqlite');
+    DatabaseSync = mod.DatabaseSync;
+    sqliteBackup = mod.backup;
+    dbAvailable = !!DatabaseSync;
+  } catch {
+    dbAvailable = false;
+  }
+}
+
+const AUDIT_DIR = path.resolve(process.cwd(), 'src/audit');
+const DB_PATH = path.join(AUDIT_DIR, 'knowledge.db');
+const BACKUP_DIR = path.join(AUDIT_DIR, 'snapshots');
+
+function ensureSnapshotDir() {
+  if (!fs.existsSync(BACKUP_DIR)) {
+    fs.mkdirSync(BACKUP_DIR, { recursive: true });
+  }
+}
+
+function safeName(label: string): string {
+  return label.replace(/[^a-zA-Z0-9._-]+/g, '-').slice(0, 80);
+}
+
+function closeDb(db: any) {
+  try {
+    if (db && typeof db[Symbol.dispose] === 'function') {
+      db[Symbol.dispose]();
+      return;
+    }
+  } catch {}
+  try {
+    if (db && typeof db.close === 'function') {
+      db.close();
+    }
+  } catch {}
+}
+
+function sha256File(filePath: string): string {
+  const h = crypto.createHash('sha256');
+  const buf = fs.readFileSync(filePath);
+  h.update(buf);
+  return h.digest('hex');
+}
+
+export interface SnapshotManifest {
+  available: boolean;
+  dbPath: string;
+  exists: boolean;
+  sizeBytes: number;
+  mtimeMs: number;
+  sha256?: string;
+  backupCount?: number;
+}
+
+export function getSnapshotManifest(): SnapshotManifest {
+  const exists = fs.existsSync(DB_PATH);
+  if (!exists) {
+    return {
+      available: dbAvailable,
+      dbPath: path.join('src', 'audit', 'knowledge.db'),
+      exists: false,
+      sizeBytes: 0,
+      mtimeMs: 0,
+      backupCount: fs.existsSync(BACKUP_DIR)
+        ? fs.readdirSync(BACKUP_DIR).filter((f) => f.endsWith('.db')).length
+        : 0,
+    };
+  }
+
+  const st = fs.statSync(DB_PATH);
+  return {
+    available: dbAvailable,
+    dbPath: path.join('src', 'audit', 'knowledge.db'),
+    exists: true,
+    sizeBytes: st.size,
+    mtimeMs: st.mtimeMs,
+    sha256: sha256File(DB_PATH),
+    backupCount: fs.existsSync(BACKUP_DIR)
+      ? fs.readdirSync(BACKUP_DIR).filter((f) => f.endsWith('.db')).length
+      : 0,
+  };
+}
+
+export async function createHotBackup(label?: string): Promise<{
+  available: boolean;
+  ok: boolean;
+  file?: string;
+  sizeBytes?: number;
+  sha256?: string;
+  pagesCopied?: number;
+  reason?: string;
+}> {
+  if (!dbAvailable || typeof sqliteBackup !== 'function') {
+    return {
+      available: false,
+      ok: false,
+      reason: 'node:sqlite backup API unavailable',
+    };
+  }
+
+  if (!fs.existsSync(DB_PATH)) {
+    return {
+      available: true,
+      ok: false,
+      reason: 'knowledge.db does not exist',
+    };
+  }
+
+  ensureSnapshotDir();
+
+  const stamp = new Date().toISOString().replace(/[:.]/g, '-');
+  const suffix = label ? `-${safeName(label)}` : '';
+  const outFile = path.join(BACKUP_DIR, `knowledge-${stamp}${suffix}.db`);
+
+  let sourceDb: any = null;
+  try {
+    sourceDb = new DatabaseSync(DB_PATH);
+
+    const pagesCopied = await sqliteBackup(sourceDb, outFile, {
+      rate: 32,
+    });
+
+    const st = fs.statSync(outFile);
+    const hash = sha256File(outFile);
+
+    return {
+      available: true,
+      ok: true,
+      file: path.relative(process.cwd(), outFile).replace(/\\/g, '/'),
+      sizeBytes: st.size,
+      sha256: hash,
+      pagesCopied,
+    };
+  } catch (e: any) {
+    return {
+      available: true,
+      ok: false,
+      reason: e?.message || 'backup failed',
+    };
+  } finally {
+    closeDb(sourceDb);
+  }
+}
+
+export function listHotBackups(limit = 50): Array<{
+  file: string;
+  sizeBytes: number;
+  mtimeMs: number;
+}> {
+  if (!fs.existsSync(BACKUP_DIR)) return [];
+  const safeLimit = Math.max(1, Math.min(500, Math.trunc(limit) || 50));
+
+  return fs.readdirSync(BACKUP_DIR)
+    .filter((f) => f.endsWith('.db'))
+    .map((f) => {
+      const full = path.join(BACKUP_DIR, f);
+      const st = fs.statSync(full);
+      return {
+        file: path.relative(process.cwd(), full).replace(/\\/g, '/'),
+        sizeBytes: st.size,
+        mtimeMs: st.mtimeMs,
+      };
+    })
+    .sort((a, b) => b.mtimeMs - a.mtimeMs)
+    .slice(0, safeLimit);
+}
+src/lib/overrides/vite-native-selftest.ts
+TypeScript
+
+import * as fs from 'node:fs';
+import * as path from 'node:path';
+
+export interface SelfTestCheck {
+  id: string;
+  pass: boolean;
+  severity: 'critical' | 'high' | 'medium' | 'low';
+  message: string;
+}
+
+export interface SelfTestResult {
+  ok: boolean;
+  checkedAt: string;
+  checks: SelfTestCheck[];
+  summary: { total: number; passed: number; failed: number; criticalFailed: number; highFailed: number };
+}
+
+function extractFnBody(src: string, fnName: string): string {
+  const candidates = [`async function ${fnName}`, `function ${fnName}`];
+  let start = -1;
+  for (const c of candidates) {
+    start = src.indexOf(c);
+    if (start >= 0) break;
+  }
+  if (start < 0) return '';
+  const brace = src.indexOf('{', start);
+  if (brace < 0) return src.slice(start, Math.min(src.length, start + 5000));
+  let depth = 0;
+  for (let i = brace; i < src.length; i++) {
+    if (src[i] === '{') depth++;
+    else if (src[i] === '}') {
+      depth--;
+      if (depth === 0) return src.slice(start, i + 1);
+    }
+  }
+  return src.slice(start, Math.min(src.length, start + 8000));
+}
+
+function hasGoodHrefCapture(fnBody: string): boolean {
+  return /href=\["'\]\(\[\^"'\]\+\)\["'\]/.test(fnBody) || fnBody.includes(`href=<!--citation:2-->["']`);
+}
+
+function hasBrokenHrefConsumption(fnBody: string): boolean {
+  return /href=\["'\]\[\^>\]\*>/.test(fnBody) || fnBody.includes(`href=["'][^>]*>([`);
+}
+
+function has(src: string, needle: string): boolean { return src.includes(needle); }
+function route(src: string, r: string): boolean { return src.includes(`'${r}'`) || src.includes(`"${r}"`); }
+
+export async function runNativeSelfTest(): Promise<SelfTestResult> {
+  const root = process.cwd();
+  const scraperPath = path.resolve(root, 'src/lib/overrides/vite-native-scraper.ts');
+  const storePath = path.resolve(root, 'src/lib/overrides/vite-native-knowledge-store.ts');
+
+  const checks: SelfTestCheck[] = [];
+  const add = (id: string, pass: boolean, severity: SelfTestCheck['severity'], message: string) =>
+    checks.push({ id, pass, severity, message });
+
+  let scraper = '';
+  let store = '';
+
+  try {
+    scraper = await fs.promises.readFile(scraperPath, 'utf-8');
+    add('scraper.file.readable', true, 'critical', 'vite-native-scraper.ts is readable.');
+  } catch {
+    add('scraper.file.readable', false, 'critical', 'vite-native-scraper.ts is missing or unreadable.');
+  }
+
+  try {
+    store = await fs.promises.readFile(storePath, 'utf-8');
+    add('knowledge.file.readable', true, 'critical', 'vite-native-knowledge-store.ts is readable.');
+  } catch {
+    add('knowledge.file.readable', false, 'critical', 'vite-native-knowledge-store.ts is missing or unreadable.');
+  }
+
+  if (scraper) {
+    const bing = extractFnBody(scraper, 'searchBing');
+    const mojeek = extractFnBody(scraper, 'searchMojeek');
+
+    add('parser.bing.exists', bing.length > 0, 'critical', 'searchBing function must exist.');
+    add('parser.bing.href.good', !!bing && hasGoodHrefCapture(bing), 'critical', 'Bing parser must capture href in group [1].');
+    add('parser.bing.href.not_broken', !!bing && !hasBrokenHrefConsumption(bing), 'critical', 'Bing parser must not consume href without capturing it.');
+
+    add('parser.mojeek.exists', mojeek.length > 0, 'critical', 'searchMojeek function must exist.');
+    add('parser.mojeek.href.good', !!mojeek && hasGoodHrefCapture(mojeek), 'critical', 'Mojeek parser must capture href in group [1].');
+    add('parser.mojeek.href.not_broken', !!mojeek && !hasBrokenHrefConsumption(mojeek), 'critical', 'Mojeek parser must not consume href without capturing it.');
+
+    add('ssrf.nul.raw', has(scraper, `includes('\\0')`) || has(scraper, `includes("\\0")`), 'critical', 'Must reject raw embedded NUL bytes.');
+    add('ssrf.nul.percent', /%00/i.test(scraper), 'critical', 'Must reject percent-encoded NUL bytes.');
+    add('ssrf.credentialed.block', has(scraper, 'Credentialed URLs are not allowed') || (has(scraper, 'username') && has(scraper, 'password')), 'critical', 'Must reject credentialed URLs.');
+    add('ssrf.metadata.block', has(scraper, 'metadata.google.internal') && has(scraper, 'localhost'), 'critical', 'Must block localhost and cloud metadata hostnames.');
+    add('ssrf.private.ipv4', has(scraper, 'blocked4') || has(scraper, 'isBlockedIPv4'), 'critical', 'Must retain private IPv4 blocklist.');
+    add('ssrf.private.ipv6', has(scraper, 'blocked6') || has(scraper, 'isBlockedIPv6'), 'critical', 'Must retain private IPv6 blocklist.');
+    add('ssrf.dns.all', has(scraper, 'all: true') && (has(scraper, 'isBlockedAddress') || has(scraper, 'blockedAddr')), 'critical', 'Must resolve all addresses and validate each.');
+    add('ssrf.dns.pin', has(scraper, 'lookup:') && (has(scraper, 'resolvedAddress') || has(scraper, 'chosen.address') || has(scraper, 'prep.addr') || has(scraper, '.addr')), 'critical', 'Outbound requests must pin to a pre-validated DNS address.');
+
+    add('safety.decompress.cap', has(scraper, 'maxOutputLength'), 'high', 'zlib decompression must bound output.');
+    add('safety.async.wrapper', has(scraper, 'Promise.resolve()') && has(scraper, '.catch'), 'high', 'Middleware must explicitly catch async rejections.');
+    add('safety.content_type.allowlist', has(scraper, 'SAFE_CT') || has(scraper, 'SAFE_CONTENT_TYPES'), 'high', 'Content-type allowlist must be present.');
+
+    add('vite.preview.hook', has(scraper, 'configurePreviewServer'), 'high', 'configurePreviewServer must be registered.');
+
+    add('route.search', route(scraper, '/api/native-search'), 'critical', 'native-search route must exist.');
+    add('route.read', route(scraper, '/api/native-read'), 'critical', 'native-read route must exist.');
+    add('route.audit.verify', route(scraper, '/api/audit/verify'), 'critical', 'audit verify route must exist.');
+    add('route.knowledge.query', route(scraper, '/api/native-knowledge/query'), 'high', 'knowledge query route must exist.');
+    add('route.knowledge.stats', route(scraper, '/api/native-knowledge/stats'), 'medium', 'knowledge stats route must exist.');
+    add('route.ingest', route(scraper, '/api/native-ingest'), 'medium', 'native-ingest route must exist.');
+
+    add('audit.hash.chain', has(scraper, 'prevHash') && has(scraper, 'entryHash') && has(scraper, 'sha256'), 'critical', 'Audit ledger must remain SHA-256 hash-chained.');
+    add('audit.append', has(scraper, 'appendAudit'), 'critical', 'appendAudit must be present.');
+
+    add('field.recalled', has(scraper, 'recalled') && has(scraper, 'queryKnowledge'), 'medium', 'search should emit additive recalled[].');
+    add('field.cache.observability', has(scraper, 'cache_hit') || has(scraper, 'cacheHit') || has(scraper, 'cacheState'), 'medium', 'Cache observability must be present.');
+    add('rank.rrf', has(scraper, 'RRF_K') || has(scraper, 'rrfFuse') || has(scraper, 'Reciprocal'), 'medium', 'RRF fusion must be present.');
+    add('rank.diversity', has(scraper, 'MMR_LAMBDA') || has(scraper, 'mmrDiv') || has(scraper, 'hammingDistanceHex') || has(scraper, 'hammingDist'), 'low', 'Diversity/near-dup logic must be present.');
+
+    add('doctor.route', route(scraper, '/api/native-doctor'), 'medium', 'Doctor route must be wired.');
+  }
+
+  if (store) {
+    add('sqlite.primary.loader', has(store, 'getBuiltinModule') && has(store, 'node:sqlite'), 'high', 'Store should prefer process.getBuiltinModule("node:sqlite").');
+    add('sqlite.fallback.loader', has(store, 'createRequire') && has(store, 'node:sqlite'), 'medium', 'Store should retain createRequire fallback.');
+    add('sqlite.safe.noop', has(store, 'dbAvailable') && has(store, 'initFailed'), 'high', 'Store must degrade safely when sqlite unavailable.');
+    add('sqlite.busy.timeout', has(store, 'busy_timeout'), 'medium', 'busy_timeout PRAGMA recommended.');
+    add('sqlite.wal', has(store, 'journal_mode') || has(store, 'WAL'), 'low', 'WAL mode recommended.');
+    add('knowledge.record.export', /export function recordKnowledge/.test(store), 'critical', 'recordKnowledge must be exported.');
+    add('knowledge.query.export', /export function queryKnowledge/.test(store), 'critical', 'queryKnowledge must be exported.');
+    add('knowledge.stats.export', /export function knowledgeStats/.test(store), 'medium', 'knowledgeStats must be exported.');
+    add('knowledge.lookup.export', /export function lookupByRef/.test(store), 'medium', 'lookupByRef must be exported.');
+  }
+
+  const failed = checks.filter((c) => !c.pass);
+  const criticalFailed = failed.filter((c) => c.severity === 'critical').length;
+  const highFailed = failed.filter((c) => c.severity === 'high').length;
+
+  return {
+    ok: criticalFailed === 0,
+    checkedAt: new Date().toISOString(),
+    checks,
+    summary: {
+      total: checks.length,
+      passed: checks.length - failed.length,
+      failed: failed.length,
+      criticalFailed,
+      highFailed,
+    },
+  };
+}
+
+src/lib/overrides/vite-native-doctor-plane.ts
+TypeScript
+
+export interface DoctorSection<T = unknown> {
+  available: boolean;
+  data?: T;
+  error?: string;
+}
+
+export interface DoctorReport {
+  status: 'green' | 'yellow' | 'red';
+  checkedAt: string;
+  summary: {
+    criticalFailed: number;
+    highFailed: number;
+    runtimePressure: string;
+    recommendations: number;
+  };
+  sections: {
+    staticSelfTest: DoctorSection;
+    functionalSelfTest: DoctorSection;
+    runtime: DoctorSection;
+    policy: DoctorSection;
+    knowledge: DoctorSection;
+    indexHealth: DoctorSection;
+    maintenance: DoctorSection;
+    failures: DoctorSection;
+    contract: DoctorSection;
+    routes: DoctorSection<string[]>;
+  };
+  recommendedActions: string[];
+}
+
+async function optionalImport<T = any>(specifier: string): Promise<T | null> {
+  try {
+    return (await import(specifier)) as T;
+  } catch {
+    return null;
+  }
+}
+
+function pickStatus(args: {
+  criticalFailed: number;
+  highFailed: number;
+  pressure: string;
+  indexConsistent?: boolean;
+}): 'green' | 'yellow' | 'red' {
+  if (args.criticalFailed > 0) return 'red';
+  if (args.pressure === 'hot') return 'red';
+  if (args.indexConsistent === false) return 'yellow';
+  if (args.highFailed > 0) return 'yellow';
+  if (args.pressure === 'warm') return 'yellow';
+  return 'green';
+}
+
+export async function buildDoctorReport(opts?: { deep?: boolean }): Promise<DoctorReport> {
+  const deep = !!opts?.deep;
+
+  const [
+    staticMod,
+    functionalMod,
+    runtimeMod,
+    policyMod,
+    storeMod,
+    contractMod,
+  ] = await Promise.all([
+    optionalImport<any>('./vite-native-selftest'),
+    optionalImport<any>('./vite-native-selftest-functional'),
+    optionalImport<any>('./vite-native-runtime-plane'),
+    optionalImport<any>('./vite-native-policy-plane'),
+    optionalImport<any>('./vite-native-knowledge-store'),
+    optionalImport<any>('./vite-native-contract-plane'),
+  ]);
+
+  const sections: DoctorReport['sections'] = {
+    staticSelfTest: { available: false },
+    functionalSelfTest: { available: false },
+    runtime: { available: false },
+    policy: { available: false },
+    knowledge: { available: false },
+    indexHealth: { available: false },
+    maintenance: { available: false },
+    failures: { available: false },
+    contract: { available: false },
+    routes: { available: false },
+  };
+
+  let criticalFailed = 0;
+  let highFailed = 0;
+  let runtimePressure = 'unknown';
+  let indexConsistent: boolean | undefined;
+  const recommendedActions: string[] = [];
+
+  if (staticMod?.runNativeSelfTest) {
+    try {
+      const r = await staticMod.runNativeSelfTest();
+      sections.staticSelfTest = { available: true, data: r };
+      criticalFailed = Math.max(criticalFailed, Number(r?.summary?.criticalFailed || 0));
+      highFailed = Math.max(highFailed, Number(r?.summary?.highFailed || 0));
+      if ((r?.summary?.criticalFailed || 0) > 0) {
+        recommendedActions.push('Fix static self-test critical failures before any new edits.');
+      }
+    } catch (e: any) {
+      sections.staticSelfTest = { available: true, error: e?.message || 'static self-test failed' };
+      criticalFailed = Math.max(criticalFailed, 1);
+      recommendedActions.push('Static self-test threw; inspect vite-native-selftest.ts.');
+    }
+  }
+
+  if (functionalMod?.runFunctionalSelfTest) {
+    if (deep) {
+      try {
+        const r = await functionalMod.runFunctionalSelfTest({ rw: false });
+        sections.functionalSelfTest = { available: true, data: r };
+        criticalFailed = Math.max(criticalFailed, Number(r?.summary?.criticalFailed || 0));
+        if ((r?.summary?.criticalFailed || 0) > 0) {
+          recommendedActions.push('Fix functional self-test failures; behavior no longer matches golden fixtures.');
+        }
+      } catch (e: any) {
+        sections.functionalSelfTest = { available: true, error: e?.message || 'functional self-test failed' };
+        criticalFailed = Math.max(criticalFailed, 1);
+      }
+    } else {
+      sections.functionalSelfTest = {
+        available: true,
+        data: { skipped: true, hint: 'Pass ?deep=true to run behavioral golden-fixture tests.' },
+      };
+    }
+  }
+
+  if (runtimeMod?.getRuntimeStats) {
+    try {
+      const r = runtimeMod.getRuntimeStats();
+      sections.runtime = { available: true, data: r };
+      runtimePressure = String(r?.pressure || 'unknown');
+      if (runtimePressure === 'hot') {
+        recommendedActions.push('Runtime pressure is hot: defer background work and stop adding features.');
+      } else if (runtimePressure === 'warm') {
+        recommendedActions.push('Runtime pressure is warm: avoid expensive bulk ingest and prefer cached routes.');
+      }
+    } catch (e: any) {
+      sections.runtime = { available: true, error: e?.message || 'runtime stats failed' };
+    }
+  }
+
+  if (storeMod?.knowledgeStats) {
+    try {
+      sections.knowledge = { available: true, data: storeMod.knowledgeStats() };
+    } catch (e: any) {
+      sections.knowledge = { available: true, error: e?.message || 'knowledge stats failed' };
+    }
+  }
+
+  if (storeMod?.knowledgeIndexHealth) {
+    try {
+      const h = storeMod.knowledgeIndexHealth();
+      sections.indexHealth = { available: true, data: h };
+      indexConsistent = !!h?.consistent;
+      if (h?.available && h?.ftsEnabled && h?.consistent === false) {
+        recommendedActions.push('Run /api/native-knowledge/repair-index to heal FTS drift.');
+      }
+    } catch (e: any) {
+      sections.indexHealth = { available: true, error: e?.message || 'index health failed' };
+    }
+  }
+
+  if (storeMod?.getMaintenanceStats) {
+    try {
+      const m = storeMod.getMaintenanceStats();
+      sections.maintenance = { available: true, data: m };
+      if ((m?.reclaimableBytes || 0) > 32 * 1024 * 1024) {
+        recommendedActions.push('Run /api/native-maintenance/run?dryRun=false to reclaim SQLite space.');
+      }
+    } catch (e: any) {
+      sections.maintenance = { available: true, error: e?.message || 'maintenance stats failed' };
+    }
+  }
+
+  if (storeMod?.getFailureStats) {
+    try {
+      const f = storeMod.getFailureStats();
+      sections.failures = { available: true, data: f };
+      if ((f?.last24h || 0) > 0) {
+        recommendedActions.push('Review /api/native-knowledge/failures for recurring bad domains or queries.');
+      }
+    } catch (e: any) {
+      sections.failures = { available: true, error: e?.message || 'failure stats failed' };
+    }
+  }
+
+  if (policyMod?.describePolicy) {
+    try {
+      const runtime = runtimeMod?.getRuntimeStats ? runtimeMod.getRuntimeStats() : { pressure: 'unknown' };
+      const engineHealth = storeMod?.getEngineHealth ? storeMod.getEngineHealth() : {};
+      const selfTestCriticalFailed =
+        sections.staticSelfTest.data && typeof sections.staticSelfTest.data === 'object'
+          ? Number((sections.staticSelfTest.data as any)?.summary?.criticalFailed || 0)
+          : 0;
+
+      sections.policy = {
+        available: true,
+        data: policyMod.describePolicy({
+          pressure: runtime.pressure,
+          engineHealth,
+          selfTestCriticalFailed,
+        }),
+      };
+    } catch (e: any) {
+      sections.policy = { available: true, error: e?.message || 'policy evaluation failed' };
+    }
+  }
+
+  if (contractMod?.contractSelfTest || contractMod?.getNativeOpenApiDocument) {
+    try {
+      const data: any = {};
+      if (contractMod.contractSelfTest) data.selftest = contractMod.contractSelfTest();
+      if (contractMod.getNativeOpenApiDocument) {
+        const doc = contractMod.getNativeOpenApiDocument();
+        data.openapiVersion = doc?.openapi;
+        data.pathCount = doc?.paths ? Object.keys(doc.paths).length : 0;
+        sections.routes = {
+          available: true,
+          data: doc?.paths ? Object.keys(doc.paths).sort() : [],
+        };
+      }
+      sections.contract = { available: true, data };
+    } catch (e: any) {
+      sections.contract = { available: true, error: e?.message || 'contract plane failed' };
+    }
+  }
+
+  const status = pickStatus({
+    criticalFailed,
+    highFailed,
+    pressure: runtimePressure,
+    indexConsistent,
+  });
+
+  if (recommendedActions.length === 0) {
+    recommendedActions.push('System is healthy. Freeze architecture and stop adding backend-only features.');
+  }
+
+  return {
+    status,
+    checkedAt: new Date().toISOString(),
+    summary: {
+      criticalFailed,
+      highFailed,
+      runtimePressure,
+      recommendations: recommendedActions.length,
+    },
+    sections,
+    recommendedActions,
+  };
+}
+
+src/lib/overrides/vite-native-doctor-plane.ts
+TypeScript
+
+export interface DoctorSection<T = unknown> {
+  available: boolean;
+  data?: T;
+  error?: string;
+}
+
+export interface DoctorReport {
+  status: 'green' | 'yellow' | 'red';
+  checkedAt: string;
+  summary: {
+    criticalFailed: number;
+    highFailed: number;
+    runtimePressure: string;
+    recommendations: number;
+  };
+  sections: {
+    staticSelfTest: DoctorSection;
+    functionalSelfTest: DoctorSection;
+    runtime: DoctorSection;
+    policy: DoctorSection;
+    knowledge: DoctorSection;
+    indexHealth: DoctorSection;
+    maintenance: DoctorSection;
+    failures: DoctorSection;
+    contract: DoctorSection;
+    routes: DoctorSection<string[]>;
+  };
+  recommendedActions: string[];
+}
+
+async function optionalImport<T = any>(specifier: string): Promise<T | null> {
+  try { return (await import(specifier)) as T; } catch { return null; }
+}
+
+function pickStatus(args: {
+  criticalFailed: number;
+  highFailed: number;
+  pressure: string;
+  indexConsistent?: boolean;
+}): 'green' | 'yellow' | 'red' {
+  if (args.criticalFailed > 0) return 'red';
+  if (args.pressure === 'hot') return 'red';
+  if (args.indexConsistent === false) return 'yellow';
+  if (args.highFailed > 0) return 'yellow';
+  if (args.pressure === 'warm') return 'yellow';
+  return 'green';
+}
+
+export async function buildDoctorReport(opts?: { deep?: boolean }): Promise<DoctorReport> {
+  const deep = !!opts?.deep;
+
+  const [staticMod, functionalMod, runtimeMod, policyMod, storeMod, contractMod] = await Promise.all([
+    optionalImport<any>('./vite-native-selftest'),
+    optionalImport<any>('./vite-native-selftest-functional'),
+    optionalImport<any>('./vite-native-runtime-plane'),
+    optionalImport<any>('./vite-native-policy-plane'),
+    optionalImport<any>('./vite-native-knowledge-store'),
+    optionalImport<any>('./vite-native-contract-plane'),
+  ]);
+
+  const sections: DoctorReport['sections'] = {
+    staticSelfTest: { available: false },
+    functionalSelfTest: { available: false },
+    runtime: { available: false },
+    policy: { available: false },
+    knowledge: { available: false },
+    indexHealth: { available: false },
+    maintenance: { available: false },
+    failures: { available: false },
+    contract: { available: false },
+    routes: { available: false },
+  };
+
+  let criticalFailed = 0;
+  let highFailed = 0;
+  let runtimePressure = 'unknown';
+  let indexConsistent: boolean | undefined = undefined;
+  const recommendedActions: string[] = [];
+
+  if (staticMod?.runNativeSelfTest) {
+    try {
+      const r = await staticMod.runNativeSelfTest();
+      sections.staticSelfTest = { available: true, data: r };
+      criticalFailed = Math.max(criticalFailed, Number(r?.summary?.criticalFailed || 0));
+      highFailed = Math.max(highFailed, Number(r?.summary?.highFailed || 0));
+      if ((r?.summary?.criticalFailed || 0) > 0) {
+        recommendedActions.push('Fix static self-test critical failures before any new edits.');
+      }
+    } catch (e: any) {
+      sections.staticSelfTest = { available: true, error: e?.message || 'static self-test failed' };
+      criticalFailed = Math.max(criticalFailed, 1);
+    }
+  }
+
+  if (functionalMod?.runFunctionalSelfTest) {
+    if (deep) {
+      try {
+        const r = await functionalMod.runFunctionalSelfTest({ rw: false });
+        sections.functionalSelfTest = { available: true, data: r };
+        criticalFailed = Math.max(criticalFailed, Number(r?.summary?.criticalFailed || 0));
+        if ((r?.summary?.criticalFailed || 0) > 0) {
+          recommendedActions.push('Fix functional self-test failures; behavior diverges from golden fixtures.');
+        }
+      } catch (e: any) {
+        sections.functionalSelfTest = { available: true, error: e?.message || 'functional self-test failed' };
+        criticalFailed = Math.max(criticalFailed, 1);
+      }
+    } else {
+      sections.functionalSelfTest = { available: true, data: { skipped: true, hint: 'Pass ?deep=true to run functional checks.' } };
+    }
+  }
+
+  if (runtimeMod?.getRuntimeStats) {
+    try {
+      const r = runtimeMod.getRuntimeStats();
+      sections.runtime = { available: true, data: r };
+      runtimePressure = String(r?.pressure || 'unknown');
+      if (runtimePressure === 'hot') recommendedActions.push('Runtime pressure is hot; background work is being shed.');
+      else if (runtimePressure === 'warm') recommendedActions.push('Runtime pressure is warm; avoid expensive bulk actions.');
+    } catch (e: any) {
+      sections.runtime = { available: true, error: e?.message || 'runtime stats failed' };
+    }
+  }
+
+  if (storeMod?.knowledgeStats) {
+    try { sections.knowledge = { available: true, data: storeMod.knowledgeStats() }; }
+    catch (e: any) { sections.knowledge = { available: true, error: e?.message || 'knowledge stats failed' }; }
+  }
+
+  if (storeMod?.knowledgeIndexHealth) {
+    try {
+      const h = storeMod.knowledgeIndexHealth();
+      sections.indexHealth = { available: true, data: h };
+      indexConsistent = !!h?.consistent;
+      if (h?.available && h?.ftsEnabled && !h?.consistent) {
+        recommendedActions.push('Run /api/native-knowledge/repair-index to heal FTS drift.');
+      }
+    } catch (e: any) {
+      sections.indexHealth = { available: true, error: e?.message || 'index health failed' };
+    }
+  }
+
+  if (storeMod?.getMaintenanceStats) {
+    try {
+      const m = storeMod.getMaintenanceStats();
+      sections.maintenance = { available: true, data: m };
+      if ((m?.reclaimableBytes || 0) > 32 * 1024 * 1024) {
+        recommendedActions.push('Run /api/native-maintenance/run?dryRun=false to reclaim SQLite space.');
+      }
+    } catch (e: any) {
+      sections.maintenance = { available: true, error: e?.message || 'maintenance stats failed' };
+    }
+  }
+
+  if (storeMod?.getFailureStats) {
+    try {
+      const f = storeMod.getFailureStats();
+      sections.failures = { available: true, data: f };
+      if ((f?.last24h || 0) > 0) recommendedActions.push('Review /api/native-knowledge/failures for recurring bad targets.');
+    } catch (e: any) {
+      sections.failures = { available: true, error: e?.message || 'failure stats failed' };
+    }
+  }
+
+  if (policyMod?.describePolicy) {
+    try {
+      const runtime = runtimeMod?.getRuntimeStats ? runtimeMod.getRuntimeStats() : { pressure: 'unknown' };
+      const engineHealth = storeMod?.getEngineHealth ? storeMod.getEngineHealth() : {};
+      const selfTestCriticalFailed =
+        sections.staticSelfTest.data && typeof sections.staticSelfTest.data === 'object'
+          ? Number((sections.staticSelfTest.data as any)?.summary?.criticalFailed || 0)
+          : 0;
+
+      sections.policy = {
+        available: true,
+        data: policyMod.describePolicy({
+          pressure: runtime.pressure,
+          engineHealth,
+          selfTestCriticalFailed,
+        }),
+      };
+    } catch (e: any) {
+      sections.policy = { available: true, error: e?.message || 'policy evaluation failed' };
+    }
+  }
+
+  if (contractMod?.contractSelfTest || contractMod?.getNativeOpenApiDocument) {
+    try {
+      const data: any = {};
+      if (contractMod.contractSelfTest) data.selftest = contractMod.contractSelfTest();
+      if (contractMod.getNativeOpenApiDocument) {
+        const doc = contractMod.getNativeOpenApiDocument();
+        data.openapiVersion = doc?.openapi;
+        data.pathCount = doc?.paths ? Object.keys(doc.paths).length : 0;
+        sections.routes = { available: true, data: doc?.paths ? Object.keys(doc.paths).sort() : [] };
+      }
+      sections.contract = { available: true, data };
+    } catch (e: any) {
+      sections.contract = { available: true, error: e?.message || 'contract plane failed' };
+    }
+  }
+
+  const status = pickStatus({
+    criticalFailed,
+    highFailed,
+    pressure: runtimePressure,
+    indexConsistent,
+  });
+
+  if (recommendedActions.length === 0) {
+    recommendedActions.push('System is healthy. Freeze backend architecture and move to frontend integration.');
+  }
+
+  return {
+    status,
+    checkedAt: new Date().toISOString(),
+    summary: {
+      criticalFailed,
+      highFailed,
+      runtimePressure,
+      recommendations: recommendedActions.length,
+    },
+    sections,
+    recommendedActions,
+  };
+}
+
+The only remaining file is `vite-native-scraper.ts`. The pasted files also have citation artifacts to fix. Let me output the scraper and note the fixes needed.
+
+**COMPLETION STATUS UPDATE:**
+
+| File | Status |
+|------|--------|
+| `vite-native-knowledge-store.ts` | ✅ Last turn |
+| `vite-native-runtime-plane.ts` | ✅ Pasted (good) |
+| `vite-native-policy-plane.ts` | ✅ Pasted (good) |
+| `vite-native-contract-plane.ts` | ✅ Pasted (good) |
+| `vite-native-replay-plane.ts` | ✅ Pasted (good) |
+| `vite-native-snapshot-plane.ts` | ✅ Pasted (good) |
+| `vite-native-doctor-plane.ts` | ✅ Pasted (good) |
+| `vite-native-selftest.ts` | ✅ Pasted (good) |
+| `vite-native-selftest-functional.ts` | ⚠️ Pasted with citation artifacts — fixed below |
+| `vite-native-chaos-harness.ts` | ⚠️ Pasted with citation artifacts — fixed below |
+| **`vite-native-scraper.ts`** | **THIS TURN** |
+
+---
+
+## FILE: `src/lib/overrides/vite-native-selftest-functional.ts` (FIXED — citation artifacts repaired)
+
+```typescript
+import * as fs from 'node:fs';
+import * as path from 'node:path';
+import * as zlib from 'node:zlib';
+
+export interface FnCheck {
+  id: string;
+  pass: boolean;
+  severity: 'critical' | 'high' | 'medium' | 'low';
+  message: string;
+  detail?: string;
+}
+
+export interface FunctionalSelfTestResult {
+  ok: boolean;
+  mode: 'functional';
+  checkedAt: string;
+  checks: FnCheck[];
+  routes: string[];
+  summary: { total: number; passed: number; failed: number; skipped: number; criticalFailed: number };
+  static?: unknown;
+}
+
+function add(checks: FnCheck[], id: string, pass: boolean, severity: FnCheck['severity'], message: string, detail?: string) {
+  checks.push({ id, pass, severity, message, detail });
+}
+
+function ddgRegex(): RegExp {
+  return /<a class="result__url" href="([^"]+)">([^<]+)<\/a>[\s\S]*?<a class="result__snippet[^>]*>([\s\S]*?)<\/a>/i;
+}
+function bingRegex(): RegExp {
+  // FIXED: proper href capture group
+  return /<h2[^>]*>\s*<a[^>]+href=["']([^"']+)["'][^>]*>([\s\S]*?)<\/a>/i;
+}
+function mojeekRegex(): RegExp {
+  // FIXED: proper href capture group
+  return /<a[^>]+class=["'][^"']*ob[^"']*["'][^>]+href=["']([^"']+)["'][^>]*>([\s\S]*?)<\/a>[\s\S]*?<p class="s">([\s\S]*?)<\/p>/i;
+}
+function yahooLegacyRegex(): RegExp {
+  return /<h3 class="title"><a[^>]+href="([^"]+)"[^>]*>([\s\S]*?)<\/a><\/h3>[\s\S]*?<div class="compTitle[^>]*>([\s\S]*?)<\/div>/i;
+}
+
+const FIX_DDG =
+  '<a class="result__url" href="https://example.com/ddg">example.com</a>' +
+  '<span></span><a class="result__snippet" href="x">DDG snippet text</a>';
+const FIX_BING =
+  '<li class="b_algo"><h2><a href="https://example.com/bing">Bing Title</a></h2><p>bing snip</p></li>';
+const FIX_MOJEEK =
+  '<a class="ob" href="https://example.com/mojeek">Mojeek</a><p class="s">Mojeek snippet</p>';
+const FIX_YAHOO =
+  '<h3 class="title"><a href="https://r.search.yahoo.com/RU=https%3A%2F%2Fexample.com%2Fyahoo/RK=2/">Yahoo</a></h3>' +
+  '<div class="compTitle">t</div>';
+
+function yahooDecode(raw: string): string {
+  let link = raw;
+  if (link.includes('/RU=')) { try { link = decodeURIComponent(link.split('/RU=')[1].split('/')[0]); } catch {} }
+  return link;
+}
+function nulGuardContract(raw: string): boolean { return raw.includes('\0') || /%00/i.test(raw); }
+function isPrivateIPv4Contract(ip: string): boolean {
+  const p = ip.split('.').map(Number);
+  if (p.length !== 4 || p.some((n) => !Number.isInteger(n) || n < 0 || n > 255)) return true;
+  const [a, b] = p;
+  return (a === 0 || a === 10 || a === 127 || (a === 100 && b >= 64 && b <= 127) || (a === 169 && b === 254) || (a === 172 && b >= 16 && b <= 31) || (a === 192 && b === 168));
+}
+
+export async function runFunctionalSelfTest(opts?: { rw?: boolean }): Promise<FunctionalSelfTestResult> {
+  const rw = !!opts?.rw;
+  const checks: FnCheck[] = [];
+  const root = process.cwd();
+  const scraperPath = path.resolve(root, 'src/lib/overrides/vite-native-scraper.ts');
+
+  let scraper = '';
+  try { scraper = await fs.promises.readFile(scraperPath, 'utf-8'); }
+  catch { add(checks, 'source.readable', false, 'high', 'vite-native-scraper.ts unreadable.'); }
+
+  const ddgM = FIX_DDG.match(ddgRegex());
+  add(checks, 'parser.ddg.extract', !!ddgM && ddgM[1] === 'https://example.com/ddg', 'critical', 'DDG regex must extract href from golden fixture.', ddgM?.[1]);
+
+  const bingM = FIX_BING.match(bingRegex());
+  add(checks, 'parser.bing.extract', !!bingM && bingM[1] === 'https://example.com/bing', 'critical', 'Bing regex must capture href URL (group 1), not anchor text.', bingM?.[1]);
+
+  const mojM = FIX_MOJEEK.match(mojeekRegex());
+  add(checks, 'parser.mojeek.extract', !!mojM && mojM[1] === 'https://example.com/mojeek', 'critical', 'Mojeek regex must capture href URL (group 1), not anchor text.', mojM?.[1]);
+
+  const yM = FIX_YAHOO.match(yahooLegacyRegex());
+  const yDecoded = yM ? yahooDecode(yM[1]) : '';
+  add(checks, 'parser.yahoo.extract', !!yM && yDecoded === 'https://example.com/yahoo', 'critical', 'Yahoo regex + /RU= decode must yield the real target URL.', yDecoded);
+
+  add(checks, 'guard.nul.behavior',
+    nulGuardContract('http://127.0.0.1%00.evil.com') === true && nulGuardContract('http://x\u0000.evil.com') === true && nulGuardContract('https://example.com') === false,
+    'critical', 'NUL-byte guard contract must flag \\0 and %00, pass clean URLs.');
+
+  add(checks, 'guard.ssrf.behavior',
+    isPrivateIPv4Contract('127.0.0.1') && isPrivateIPv4Contract('10.0.0.1') && isPrivateIPv4Contract('169.254.169.254') && isPrivateIPv4Contract('192.168.1.1') && !isPrivateIPv4Contract('8.8.8.8'),
+    'critical', 'SSRF IPv4 blocklist must block private ranges, allow public.');
+
+  try {
+    const orig = 'terminal-architecture '.repeat(64);
+    const gz = zlib.gzipSync(Buffer.from(orig, 'utf-8'));
+    const back = zlib.gunzipSync(gz).toString('utf-8');
+    add(checks, 'zlib.roundtrip', back === orig, 'high', 'node:zlib gzip round-trip must be lossless.');
+    let capped = false;
+    try { zlib.gunzipSync(gz, { maxOutputLength: 8 }); } catch { capped = true; }
+    add(checks, 'zlib.maxOutputLength', capped, 'high', 'node:zlib must enforce maxOutputLength.');
+  } catch (e: any) { add(checks, 'zlib.available', false, 'high', 'node:zlib unavailable.', e?.message); }
+
+  let store: any = null;
+  try { store = await import('./vite-native-knowledge-store'); }
+  catch (e: any) { add(checks, 'store.import', false, 'high', 'knowledge store import failed.', e?.message); }
+
+  if (store) {
+    if (typeof store.queryKnowledge === 'function') {
+      let arr: any = null, threw = false;
+      try { arr = store.queryKnowledge('__selftest_probe_nonexistent__', 3); } catch { threw = true; }
+      add(checks, 'store.query.readonly', !threw && Array.isArray(arr), 'high', 'queryKnowledge must return an array without throwing.');
+    } else { add(checks, 'store.query.export', false, 'critical', 'queryKnowledge export missing.'); }
+
+    if (typeof store.knowledgeStats === 'function') {
+      let stats: any = null, threw = false;
+      try { stats = store.knowledgeStats(); } catch { threw = true; }
+      add(checks, 'store.stats.readonly', !threw && !!stats && typeof stats === 'object', 'medium', 'knowledgeStats must return an object without throwing.');
+    }
+
+    if (typeof store.getCachedSearch === 'function') {
+      let threw = false;
+      try { store.getCachedSearch('__selftest_cache_miss__'); } catch { threw = true; }
+      add(checks, 'store.cache.readonly', !threw, 'medium', 'getCachedSearch must not throw on a miss.');
+    }
+
+    if (typeof store.redactSecrets === 'function') {
+      const dirty = 'const k="AKIA1234567890ABCDEF"; token="ghp_' + 'x'.repeat(36) + '";';
+      const clean = store.redactSecrets(dirty);
+      add(checks, 'store.secret.redaction', !clean.includes('AKIA1234567890ABCDEF') && !/ghp_x{36}/.test(clean), 'critical', 'redactSecrets must scrub AWS/GitHub tokens.');
+    }
+
+    if (rw) {
+      const setFn = typeof store.setScratchpad === 'function' ? store.setScratchpad : null;
+      const getFn = typeof store.getScratchpad === 'function' ? store.getScratchpad : null;
+      if (setFn && getFn) {
+        try {
+          const key = '__selftest_scratch__';
+          const token = `probe-${Date.now()}`;
+          setFn(key, token);
+          const readBack = getFn(key);
+          const val = readBack && typeof readBack === 'object' && 'value' in readBack ? readBack.value : readBack;
+          add(checks, 'store.scratchpad.roundtrip', String(val).includes(token), 'medium', 'Scratchpad KV must round-trip a written value.');
+        } catch (e: any) { add(checks, 'store.scratchpad.roundtrip', false, 'medium', 'Scratchpad round-trip threw.', e?.message); }
+      } else { add(checks, 'store.scratchpad.roundtrip', true, 'low', 'Scratchpad exports absent — skipped.'); }
+    }
+  }
+
+  // FIXED: proper regex for route extraction
+  const routes = scraper
+    ? Array.from(new Set([...scraper.matchAll(/['"](\/api\/[a-z0-9/_-]+)['"]/gi)].map((m) => m[1]))).sort()
+    : [];
+
+  let staticResult: unknown;
+  try {
+    const st: any = await import('./vite-native-selftest');
+    if (typeof st.runNativeSelfTest === 'function') staticResult = await st.runNativeSelfTest();
+  } catch {}
+
+  const failed = checks.filter((c) => !c.pass);
+  const criticalFailed = failed.filter((c) => c.severity === 'critical').length;
+
+  return {
+    ok: criticalFailed === 0,
+    mode: 'functional',
+    checkedAt: new Date().toISOString(),
+    checks,
+    routes,
+    summary: { total: checks.length, passed: checks.length - failed.length, failed: failed.length, skipped: checks.filter((c) => c.message.endsWith('skipped.')).length, criticalFailed },
+    static: staticResult,
+  };
+}
+```
+
+---
+
+## FILE: `src/lib/overrides/vite-native-chaos-harness.ts` (FIXED)
+
+```typescript
+import * as fs from 'node:fs';
+import * as path from 'node:path';
+
+export interface ChaosCheck {
+  id: string;
+  pass: boolean;
+  severity: 'critical' | 'high' | 'medium' | 'low';
+  message: string;
+  detail?: unknown;
+}
+
+export interface ChaosResult {
+  ok: boolean;
+  seed: number;
+  iterations: number;
+  checkedAt: string;
+  checks: ChaosCheck[];
+  summary: { total: number; passed: number; failed: number; criticalFailed: number };
+}
+
+function add(checks: ChaosCheck[], id: string, pass: boolean, severity: ChaosCheck['severity'], message: string, detail?: unknown) {
+  checks.push({ id, pass, severity, message, detail });
+}
+
+function xorshift32(seed: number): () => number {
+  let x = seed >>> 0;
+  return () => { x ^= x << 13; x ^= x >>> 17; x ^= x << 5; return (x >>> 0) / 0xffffffff; };
+}
+
+function pick<T>(rng: () => number, xs: T[]): T { return xs[Math.floor(rng() * xs.length)]; }
+
+function randomAlphaNum(rng: () => number, len: number): string {
+  const chars = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789_-';
+  let out = '';
+  for (let i = 0; i < len; i++) out += chars[Math.floor(rng() * chars.length)];
+  return out;
+}
+
+function blockedHostVariants(rng: () => number): string[] {
+  const hosts = ['127.0.0.1','0.0.0.0','10.0.0.1','192.168.1.1','172.16.0.1','169.254.169.254','localhost','metadata.google.internal','[::1]','[::]','[fe80::1]','[fc00::1]','[fd00::1]','[::ffff:127.0.0.1]','[::ffff:169.254.169.254]'];
+  const schemes = ['http','https'];
+  const suffixes = ['','/','/latest/meta-data/','/admin','?q=x'];
+  const userinfo = ['','user:pass@'];
+  const out: string[] = [];
+  for (let i = 0; i < 64; i++) {
+    out.push(`${pick(rng, schemes)}://${pick(rng, userinfo)}${pick(rng, hosts)}${pick(rng, suffixes)}`);
+  }
+  out.push('http://127.0.0.1%00.example.com/','http://example.com%00.127.0.0.1/','http://127.0.0.1\u0000.example.com/','http://metadata.google.internal%00.example.com/','file:///etc/passwd','gopher://127.0.0.1:6379/_PING','ftp://127.0.0.1/file','data:text/plain,hello');
+  return out;
+}
+
+function secretFixtures(rng: () => number): string[] {
+  return [
+    `AWS_ACCESS_KEY_ID=AKIA${randomAlphaNum(rng, 16).toUpperCase()}`,
+    `token="ghp_${randomAlphaNum(rng, 40)}"`,
+    `github_pat_${randomAlphaNum(rng, 70)}`,
+    `Authorization: Bearer ${randomAlphaNum(rng, 32)}`,
+    `OPENAI_API_KEY=sk-${randomAlphaNum(rng, 48)}`,
+    `-----BEGIN PRIVATE KEY-----\n${randomAlphaNum(rng, 96)}\n-----END PRIVATE KEY-----`,
+    `stripe_secret=sk_live_${randomAlphaNum(rng, 32)}`,
+    `SENDGRID=SG.${randomAlphaNum(rng, 22)}.${randomAlphaNum(rng, 32)}`,
+    `GOOGLE=AIza${randomAlphaNum(rng, 35)}`,
+    `jwt=eyJ${randomAlphaNum(rng, 20)}.${randomAlphaNum(rng, 20)}.${randomAlphaNum(rng, 20)}`,
+  ];
+}
+
+function extractFunctionSource(source: string, fnName: string): string {
+  const candidates = [`async function ${fnName}`, `function ${fnName}`];
+  let start = -1;
+  for (const c of candidates) { start = source.indexOf(c); if (start >= 0) break; }
+  if (start < 0) return '';
+  const brace = source.indexOf('{', start);
+  if (brace < 0) return source.slice(start, start + 5000);
+  let depth = 0;
+  for (let i = brace; i < source.length; i++) {
+    if (source[i] === '{') depth++;
+    if (source[i] === '}') { depth--; if (depth === 0) return source.slice(start, i + 1); }
+  }
+  return source.slice(start, start + 8000);
+}
+
+// FIXED: no citation artifacts
+function hasGoodHrefCapture(fnSrc: string): boolean {
+  return fnSrc.includes(`href=["']([^"']+)["']`) || /href=\["'\]\(\[\^"'\]\+\)\["'\]/.test(fnSrc);
+}
+
+function hasKnownBadHrefConsumption(fnSrc: string): boolean {
+  return fnSrc.includes(`href=["'][^>]*>([`) || /href=\["'\]\[\^>\]\*>/.test(fnSrc);
+}
+
+async function expectReject(validator: (url: string) => Promise<unknown>, url: string): Promise<boolean> {
+  try { await validator(url); return false; } catch { return true; }
+}
+
+export async function runNativeChaosHarness(opts: {
+  seed?: number;
+  iterations?: number;
+  root?: string;
+  validateUrl: (url: string) => Promise<unknown>;
+  redactSecrets?: (text: string) => string;
+}): Promise<ChaosResult> {
+  const seed = Number.isFinite(opts.seed) ? Number(opts.seed) : 0x0badc0de;
+  const iterations = Math.max(1, Math.min(500, Math.trunc(opts.iterations ?? 128)));
+  const rng = xorshift32(seed);
+  const checks: ChaosCheck[] = [];
+  const root = opts.root || process.cwd();
+
+  const blocked = blockedHostVariants(rng).slice(0, iterations);
+  const failures: string[] = [];
+  for (const url of blocked) { const rejected = await expectReject(opts.validateUrl, url); if (!rejected) failures.push(url); }
+
+  add(checks, 'chaos.ssrf.generated.rejects', failures.length === 0, 'critical', 'All generated SSRF/NUL/protocol payloads must be rejected by the live validator.', failures.slice(0, 10));
+
+  try {
+    const scraper = await fs.promises.readFile(path.resolve(root, 'src/lib/overrides/vite-native-scraper.ts'), 'utf-8');
+    const bing = extractFunctionSource(scraper, 'searchBing');
+    const mojeek = extractFunctionSource(scraper, 'searchMojeek');
+
+    add(checks, 'chaos.parser.bing.href.capture', !!bing && hasGoodHrefCapture(bing) && !hasKnownBadHrefConsumption(bing), 'critical', 'Bing parser must capture href URL and must not consume href without capture.');
+    add(checks, 'chaos.parser.mojeek.href.capture', !!mojeek && hasGoodHrefCapture(mojeek) && !hasKnownBadHrefConsumption(mojeek), 'critical', 'Mojeek parser must capture href URL and must not consume href without capture.');
+    add(checks, 'chaos.source.no.citation.artifacts', !scraper.includes('<!--citation') && !/citation:\d+/.test(scraper), 'high', 'Scraper source must not contain pasted citation artifacts.');
+  } catch (err: any) {
+    add(checks, 'chaos.source.read', false, 'high', 'Could not read scraper source for parser invariants.', err?.message);
+  }
+
+  if (opts.redactSecrets) {
+    const dirty = secretFixtures(rng).join('\n');
+    const clean = opts.redactSecrets(dirty);
+    add(checks, 'chaos.secrets.redacted',
+      !/AKIA[A-Z0-9]{16}/.test(clean) && !/\bgh[pousr]_[A-Za-z0-9]{36,}\b/.test(clean) && !/\bgithub_pat_[A-Za-z0-9_]{60,}\b/.test(clean) && !/\bsk-(?:proj-)?[A-Za-z0-9_-]{20,}\b/.test(clean) && !/-----BEGIN[ A-Z0-9]*PRIVATE KEY-----/.test(clean),
+      'critical', 'Secret redactor must remove generated credential fixtures.');
+  } else {
+    add(checks, 'chaos.secrets.redactor.available', true, 'low', 'Secret redactor not supplied; skipped.');
+  }
+
+  const sample1 = blockedHostVariants(xorshift32(seed)).slice(0, 5).join('|');
+  const sample2 = blockedHostVariants(xorshift32(seed)).slice(0, 5).join('|');
+  add(checks, 'chaos.deterministic.seed', sample1 === sample2, 'medium', 'Chaos harness must be deterministic for the same seed.');
+
+  const failed = checks.filter((c) => !c.pass);
+  const criticalFailed = failed.filter((c) => c.severity === 'critical').length;
+
+  return {
+    ok: criticalFailed === 0,
+    seed,
+    iterations,
+    checkedAt: new Date().toISOString(),
+    checks,
+    summary: { total: checks.length, passed: checks.length - failed.length, failed: failed.length, criticalFailed },
+  };
+}
+```
+
+---
+
+## FILE: `src/lib/overrides/vite-native-scraper.ts` (COMPLETE)
+
+```typescript
+import type { Plugin } from 'vite';
+import * as https from 'node:https';
+import * as http from 'node:http';
+import { URL } from 'node:url';
+import { lookup as dnsLookup } from 'node:dns/promises';
+import * as net from 'node:net';
+import * as crypto from 'node:crypto';
+import * as fs from 'node:fs';
+import * as path from 'node:path';
+import * as zlib from 'node:zlib';
+import * as readline from 'node:readline';
+import { promisify } from 'node:util';
+import { performance } from 'node:perf_hooks';
+
+import {
+  recordKnowledge, recordKnowledgeWithSession, recordKnowledgeBatch, recordKnowledgeChunked,
+  purgeKnowledge, lookupByRef, queryKnowledge, findSimilarKnowledge,
+  getCachedSearch, setCachedSearch, httpCacheGet, httpCacheSet,
+  getRobotsCache, setRobotsCache, setScratchpad, getScratchpad,
+  deleteScratchpad, listScratchpadKeys, recordCodeEdges, getDependencies,
+  getDependents, recordEngineOutcome, getEngineHealth, recordFailure,
+  getFailureScore, getFailureStats, shouldSkipIngest, isNearDuplicateContent,
+  compactKnowledgeStore, repairKnowledgeFts, knowledgeIndexHealth,
+  redactSecrets, scanForInjection, isIngestDenied, computeSimHash64,
+  hammingDistanceHex, sha256Hex, getBlastRadius, synthesizeKnowledge,
+  estimateTokens, budgetTruncate, maybeOptimizeDb, getSessionId,
+  getSessionTimeline, knowledgeStats,
+} from './vite-native-knowledge-store';
+
+import { emitRuntimeEvent, getRuntimeStats, shouldDeferBackgroundWork, listRuntimeEvents } from './vite-native-runtime-plane';
+import { evaluatePolicy, describePolicy, setPolicyOverride, clearPolicyOverride, applySelfTestRemediation } from './vite-native-policy-plane';
+import { buildDoctorReport } from './vite-native-doctor-plane';
+import { getNativeOpenApiDocument, getProblemCatalog, contractSelfTest } from './vite-native-contract-plane';
+import { recordReplay, listReplays, getReplay, summarizeReplayDiff } from './vite-native-replay-plane';
+import { getSnapshotManifest, createHotBackup, listHotBackups } from './vite-native-snapshot-plane';
+import { runNativeSelfTest } from './vite-native-selftest';
+import { runFunctionalSelfTest } from './vite-native-selftest-functional';
+import { runNativeChaosHarness } from './vite-native-chaos-harness';
+
+const gunzip = promisify(zlib.gunzip);
+const inflate = promisify(zlib.inflate);
+const inflateRaw = promisify(zlib.inflateRaw);
+const brotli = promisify(zlib.brotliDecompress);
+const zAny: any = zlib;
+const zstdSupported = typeof zAny.zstdDecompressSync === 'function';
+
+// --- Constants ---
+const ZERO_HASH = '0'.repeat(64);
+const MAX_COMPRESSED_BYTES = 5 * 1024 * 1024;
+const MAX_DECODED_BYTES = 750_000;
+const MAX_PARSE_CHARS = 300_000;
+const MAX_READ_CHARS = 25_000;
+const MAX_QUERY_LEN = 512;
+const MAX_URL_LEN = 2048;
+const MAX_RESULTS = 20;
+const MAX_REDIRECTS = 5;
+const MAX_INGEST_BYTES = 1 * 1024 * 1024;
+const SEARCH_CACHE_TTL_MS = 15 * 60 * 1000;
+const SEARCH_CACHE_SWR_MS = 45 * 60 * 1000;
+const SEARCH_CACHE_MAX = 256;
+const RRF_K = 60;
+const MMR_LAMBDA = 0.7;
+const WATCHER_DEBOUNCE_MS = 2000;
+const WATCHER_EXTS = /\.(ts|tsx|js|jsx|py|go|rs|java|css|json|md|txt)$/i;
+const ROBOTS_TTL_MS = 6 * 60 * 60_000;
+const DNS_CACHE_TTL_MS = 30_000;
+
+const SAFE_CT = [
+  /^text\/html\b/i, /^application\/xhtml\+xml\b/i, /^text\/plain\b/i,
+  /^application\/xml\b/i, /^text\/xml\b/i, /^application\/json\b/i,
+  /^application\/rss\+xml\b/i, /^application\/atom\+xml\b/i,
+];
+
+const TRACKING_PARAMS = new Set([
+  'utm_source','utm_medium','utm_campaign','utm_term','utm_content','utm_id',
+  'fbclid','gclid','msclkid','dclid','yclid','twclid','igshid','_ga','_gl',
+  'mc_cid','mc_eid','mkt_tok','trk','ref','ref_src','source','pk_campaign',
+  'pk_kwd','hsCtaTracking','_hsenc','_hsmi',
+]);
+
+const BLOCK_PAGE_KEYWORDS = [
+  'captcha','unusual traffic','automated queries','are you a robot',
+  'verify you are human','access denied','blocked by network security',
+];
+
+// --- Top-level state ---
+class Mutex {
+  private m = Promise.resolve();
+  lock(): Promise<() => void> {
+    let b: (u: () => void) => void = () => {};
+    this.m = this.m.then(() => new Promise(b));
+    return new Promise(r => { b = r; });
+  }
+}
+
+interface SR { title: string; url: string; description: string; content: string; engine: string; }
+interface L1E { results: SR[]; fresh: number; stale: number; }
+type IPF = 4 | 6;
+type RA = { address: string; family: IPF };
+type PT = { parsedUrl: URL; rh: string; addrs: RA[] };
+type Timings = Record<string, number>;
+
+const auditMutex = new Mutex();
+const searchCache = new Map<string, L1E>();
+const refreshInFlight = new Set<string>();
+const inflightSearches = new Map<string, Promise<{ results: SR[]; cs: string }>>();
+const dnsCache = new Map<string, { addrs: RA[]; ts: number }>();
+const robotsMemo = new Map<string, { disallow: string[]; ts: number }>();
+const agentRequests = new Map<string, number[]>();
+const sseSubscribers = new Set<any>();
+let autoRAGWatcher: fs.FSWatcher | null = null;
+
+const AUDIT_DIR = path.resolve(process.cwd(), 'src/audit');
+const LEDGER_PATH = path.join(AUDIT_DIR, 'ledger.jsonl');
+let cachedLastHash: string | null = null;
+
+// Background cleanup
+const bgCleanup = setInterval(() => {
+  const now = Date.now();
+  for (const [h, s] of circuitBreaker.entries()) if (s.openUntil > 0 && s.openUntil < now) circuitBreaker.delete(h);
+  for (const [k, e] of searchCache.entries()) if (e.stale < now) searchCache.delete(k);
+  for (const [k, e] of dnsCache.entries()) if (now - e.ts > DNS_CACHE_TTL_MS) dnsCache.delete(k);
+  try { maybeOptimizeDb(); } catch {}
+}, 120_000);
+if (typeof (bgCleanup as any).unref === 'function') (bgCleanup as any).unref();
+
+// Periodic compaction
+let lastCompactTs = 0;
+setInterval(() => {
+  if (Date.now() - lastCompactTs < 30 * 60_000) return;
+  lastCompactTs = Date.now();
+  try { compactKnowledgeStore(3); } catch {}
+}, 120_000).unref?.();
+
+// SSE heartbeat
+const sseHeartbeat = setInterval(() => {
+  if (sseSubscribers.size === 0) return;
+  for (const res of sseSubscribers) {
+    try {
+      if (res.writableEnded || res.destroyed) { sseSubscribers.delete(res); continue; }
+      res.write(':heartbeat\n\n');
+    } catch { sseSubscribers.delete(res); }
+  }
+}, 25_000);
+if (typeof (sseHeartbeat as any).unref === 'function') (sseHeartbeat as any).unref();
+
+function broadcastEvent(eventType: string, data: unknown): void {
+  if (sseSubscribers.size === 0) return;
+  const payload = `event: ${eventType}\ndata: ${JSON.stringify(data)}\n\n`;
+  for (const res of sseSubscribers) {
+    try {
+      if (res.writableEnded || res.destroyed) { sseSubscribers.delete(res); continue; }
+      res.write(payload);
+    } catch { sseSubscribers.delete(res); }
+  }
+}
+
+// --- Audit ledger ---
+async function ensureAuditDir() { if (!fs.existsSync(AUDIT_DIR)) await fs.promises.mkdir(AUDIT_DIR, { recursive: true }); }
+
+function isH64(v: unknown): v is string { return typeof v === 'string' && /^[a-f0-9]{64}$/i.test(v); }
+
+async function ledgerNeedsSep(): Promise<boolean> {
+  try {
+    const s = await fs.promises.stat(LEDGER_PATH); if (s.size === 0) return false;
+    const f = await fs.promises.open(LEDGER_PATH, 'r');
+    try { const b = Buffer.alloc(1); await f.read(b, 0, 1, s.size - 1); return b[0] !== 0x0a; } finally { await f.close(); }
+  } catch { return false; }
+}
+
+async function getLastHash(): Promise<string> {
+  if (cachedLastHash !== null) return cachedLastHash;
+  await ensureAuditDir();
+  if (!fs.existsSync(LEDGER_PATH)) { cachedLastHash = ZERO_HASH; return cachedLastHash; }
+  const rl = readline.createInterface({ input: fs.createReadStream(LEDGER_PATH), crlfDelay: Infinity });
+  let last = ZERO_HASH;
+  for await (const line of rl) { if (!line.trim()) continue; try { const e = JSON.parse(line); if (isH64(e.entryHash)) last = e.entryHash; } catch {} }
+  cachedLastHash = last; return last;
+}
+
+async function appendAudit(record: unknown, causalParent: string | null = null): Promise<string> {
+  const unlock = await auditMutex.lock();
+  try {
+    await ensureAuditDir();
+    const prev = await getLastHash();
+    const payload = { ts: new Date().toISOString(), prevHash: prev, causalParent, record };
+    const body = JSON.stringify(payload);
+    const eh = crypto.createHash('sha256').update(`${prev}${body}`).digest('hex');
+    const pfx = (await ledgerNeedsSep()) ? '\n' : '';
+    await fs.promises.appendFile(LEDGER_PATH, `${pfx}${JSON.stringify({ ...payload, entryHash: eh })}\n`, 'utf-8');
+    cachedLastHash = eh; return eh;
+  } finally { unlock(); }
+}
+
+async function verifyLedger(): Promise<any> {
+  await ensureAuditDir();
+  if (!fs.existsSync(LEDGER_PATH)) return { intact: true, entriesChecked: 0 };
+  const rl = readline.createInterface({ input: fs.createReadStream(LEDGER_PATH), crlfDelay: Infinity });
+  let prev = ZERO_HASH, cnt = 0, ln = 0;
+  for await (const line of rl) {
+    ln++; if (!line.trim()) continue;
+    let e: any; try { e = JSON.parse(line); } catch { return { intact: false, entriesChecked: cnt, failedAtLine: ln, reason: 'Invalid JSON' }; }
+    const p = { ts: e.ts, prevHash: e.prevHash, causalParent: e.causalParent ?? null, record: e.record };
+    const exp = crypto.createHash('sha256').update(`${prev}${JSON.stringify(p)}`).digest('hex');
+    if (e.prevHash !== prev || exp !== e.entryHash) return { intact: false, entriesChecked: cnt, failedAtLine: ln };
+    prev = e.entryHash; cnt++;
+  }
+  cachedLastHash = prev; return { intact: true, entriesChecked: cnt };
+}
+
+// --- Helpers ---
+function redactPII(t: string): string {
+  return t.replace(/[\w.+-]+@[\w-]+\.[\w.-]+/g,'[EMAIL]').replace(/\b(?:\d[ -]?){13,16}\b/g,'[CARD]').replace(/\b\d{3}-\d{2}-\d{4}\b/g,'[SSN]');
+}
+function sha256T(t: string): string { return crypto.createHash('sha256').update(t).digest('hex'); }
+function safeAuditUrl(r: string) {
+  try { const u = new URL(r); return { url: redactPII(`${u.origin}${u.pathname}`).slice(0,512), urlHash: sha256T(r) }; }
+  catch { return { url: '[invalid-url]', urlHash: sha256T(r||'') }; }
+}
+function safeAuditQuery(q: string) { return { query: redactPII(q).slice(0,MAX_QUERY_LEN), queryHash: sha256T(q) }; }
+function hv(v: string|string[]|undefined): string { return Array.isArray(v)?v.join(', '):(v||''); }
+
+function sendJson(res: any, body: unknown, sc = 200, timings?: Timings) {
+  if (res.headersSent) return; res.statusCode = sc;
+  res.setHeader('Content-Type','application/json; charset=utf-8');
+  res.setHeader('X-Content-Type-Options','nosniff'); res.setHeader('Cache-Control','no-store');
+  if (timings) { const p = Object.entries(timings).map(([k,v])=>`${k};dur=${v.toFixed(1)}`); if (p.length) res.setHeader('Server-Timing',p.join(', ')); }
+  res.end(JSON.stringify(body));
+}
+
+function scrubForPersistence(text: string): string {
+  const inj = scanForInjection(text);
+  return redactPII(redactSecrets(inj.clean ? text : (inj.scrubbed ?? text)));
+}
+
+// --- SSRF defense ---
+const circuitBreaker = new Map<string, { fails: number; openUntil: number }>();
+
+function parseRetryAfterMs(headerVal: string|undefined): number|null {
+  if (!headerVal) return null;
+  const v = headerVal.trim();
+  if (/^\d+$/.test(v)) { const s = Number(v); if (Number.isFinite(s) && s >= 0) return Math.min(s*1000, 15*60_000); }
+  const d = Date.parse(v); if (!Number.isNaN(d)) { const delta = d - Date.now(); if (delta > 0) return Math.min(delta, 15*60_000); }
+  return null;
+}
+
+function tripBreaker(host: string, retryAfterMs: number|null) {
+  const fails = (circuitBreaker.get(host)?.fails||0)+1;
+  let cooldown: number;
+  if (retryAfterMs !== null) { cooldown = retryAfterMs; }
+  else if (fails >= 3) { const backoff = Math.min(60_000*2**(fails-3),300_000); cooldown = backoff+Math.floor(Math.random()*5000); }
+  else { cooldown = 0; }
+  circuitBreaker.set(host, { fails, openUntil: cooldown > 0 ? Date.now()+cooldown : 0 });
+}
+
+function looksLikeBlockPage(text: string): boolean {
+  const head = text.slice(0,4000).toLowerCase();
+  return BLOCK_PAGE_KEYWORDS.some(k => head.includes(k));
+}
+
+function canon(h: string): string { return h.replace(/^\[/,'').replace(/\]$/,'').replace(/\.$/,'').toLowerCase(); }
+function ip4p(ip: string): number[]|null { const p=ip.split('.').map(Number); if(p.length!==4||p.some(n=>!Number.isInteger(n)||n<0||n>255)) return null; return p; }
+function blocked4(ip: string): boolean {
+  const p=ip4p(ip); if(!p) return true;
+  const [a,b,c]=p;
+  return (a===0||a===10||a===127||(a===100&&b>=64&&b<=127)||(a===169&&b===254)||(a===172&&b>=16&&b<=31)||(a===192&&b===0)||(a===192&&b===168)||(a===192&&b===0&&c===2)||(a===198&&(b===18||b===19))||(a===198&&b===51&&c===100)||(a===203&&b===0&&c===113)||a>=224);
+}
+function blocked6(ip: string): boolean {
+  const x=canon(ip);
+  const m=x.match(/^::ffff:(\d{1,3}(?:\.\d{1,3}){3})$/i); if(m) return blocked4(m[1]);
+  return (x==='::'||x==='::1'||x.startsWith('fc')||x.startsWith('fd')||x.startsWith('fe8')||x.startsWith('fe9')||x.startsWith('fea')||x.startsWith('feb')||x.startsWith('ff'));
+}
+function blockedAddr(a: string): boolean { const n=canon(a); const f=net.isIP(n); if(f===4) return blocked4(n); if(f===6) return blocked6(n); return true; }
+
+async function prepTarget(raw: string): Promise<PT> {
+  if (!raw||raw.length>MAX_URL_LEN) throw new Error('Invalid URL');
+  if (raw.includes('\0')||/%00/i.test(raw)) throw new Error('Invalid URL formulation: NUL byte detected');
+  let p: URL; try { p=new URL(raw.trim()); } catch { throw new Error('Invalid URL formulation'); }
+  const rh=canon(p.hostname);
+  if (!/^https?:$/.test(p.protocol)) throw new Error('Unsupported protocol');
+  if (!rh) throw new Error('Missing hostname');
+  if (p.username||p.password) throw new Error('Credentialed URLs are not allowed');
+  if (rh==='localhost'||rh.endsWith('.localhost')||rh==='metadata.google.internal') throw new Error('Blocked target address');
+  const df=net.isIP(rh);
+  if (df) { if(blockedAddr(rh)) throw new Error('Blocked target address'); return {parsedUrl:p,rh,addrs:[{address:rh,family:df===6?6:4}]}; }
+  let addrs: RA[];
+  const cached=dnsCache.get(rh);
+  if (cached&&Date.now()-cached.ts<DNS_CACHE_TTL_MS) {
+    addrs=cached.addrs;
+  } else {
+    const res=await dnsLookup(rh,{all:true,verbatim:true});
+    if (!res.length) throw new Error('Failed to resolve target address');
+    addrs=[];
+    for (const a of res) { const f=net.isIP(a.address); if(f===4||f===6) addrs.push({address:a.address,family:f}); }
+    if (!addrs.length) throw new Error('Failed to resolve target address');
+    dnsCache.set(rh,{addrs,ts:Date.now()});
+  }
+  for (const a of addrs) if(blockedAddr(a.address)) throw new Error('Blocked target address');
+  return {parsedUrl:p,rh,addrs};
+}
+
+function isRetriable(e: any): boolean { const c=String(e?.code||''); return ['ETIMEDOUT','ECONNRESET','ECONNREFUSED','EHOSTUNREACH','ENETUNREACH','EAI_AGAIN','EPIPE'].includes(c); }
+
+const httpAgent = new http.Agent({ keepAlive:true, maxSockets:50, maxFreeSockets:10, timeout:60_000, scheduling:'lifo' });
+const httpsAgent = new https.Agent({ keepAlive:true, maxSockets:50, maxFreeSockets:10, timeout:60_000, scheduling:'lifo' });
+
+async function decompBody(body: Buffer, enc: string): Promise<string> {
+  const n=enc.toLowerCase(); const opts={maxOutputLength:MAX_DECODED_BYTES};
+  try {
+    if (n.includes('zstd')&&zstdSupported) { try { return (zAny.zstdDecompressSync(body,opts) as Buffer).toString('utf-8'); } catch {} }
+    if (n.includes('br')) return ((await brotli(body,opts)) as Buffer).toString('utf-8');
+    if (n.includes('gzip')) return ((await gunzip(body,opts)) as Buffer).toString('utf-8');
+    if (n.includes('deflate')) { try { return ((await inflate(body,opts)) as Buffer).toString('utf-8'); } catch { return ((await inflateRaw(body,opts)) as Buffer).toString('utf-8'); } }
+    return body.toString('utf-8',0,Math.min(body.length,MAX_DECODED_BYTES));
+  } catch { return body.toString('utf-8',0,Math.min(body.length,MAX_DECODED_BYTES)); }
+}
+
+function acceptEncoding(): string { return zstdSupported ? 'gzip, deflate, br, zstd' : 'gzip, deflate, br'; }
+
+function reqTarget(prep: PT, url: string, tMs: number, rCnt: number, ai=0): Promise<string> {
+  const hn=prep.rh; const cb=circuitBreaker.get(hn);
+  if (cb&&cb.openUntil>Date.now()) return Promise.reject(new Error('Circuit Breaker Open'));
+  const ch=prep.addrs[ai]; if(!ch) return Promise.reject(new Error('Failed to resolve'));
+  return new Promise<string>((resolve,reject) => {
+    let settled=false, saw=false;
+    const ok=(v:string)=>{if(!settled){settled=true;resolve(v);}};
+    const er=(e:unknown)=>{if(!settled){settled=true;reject(e instanceof Error?e:new Error(String(e)));}};
+    const isS=prep.parsedUrl.protocol==='https:';
+    const req=(isS?https:http).get({
+      protocol:prep.parsedUrl.protocol,hostname:hn,
+      port:prep.parsedUrl.port?Number(prep.parsedUrl.port):isS?443:80,
+      path:`${prep.parsedUrl.pathname}${prep.parsedUrl.search}`,
+      agent:isS?httpsAgent:httpAgent,timeout:tMs,
+      lookup:((_h:string,_o:unknown,cb:any)=>cb(null,ch.address,ch.family)) as any,
+      headers:{'User-Agent':'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36','Accept':'text/html,application/xhtml+xml,application/xml;q=0.9,text/plain;q=0.8,application/json;q=0.7,*/*;q=0.6','Accept-Language':'en-US,en;q=0.5','Accept-Encoding':acceptEncoding()},
+    } as any,(res)=>{
+      saw=true; const sc=res.statusCode||0; const loc=hv(res.headers.location);
+      const ra=parseRetryAfterMs(hv(res.headers['retry-after']));
+      if (sc>=300&&sc<400&&loc){res.resume();nodeFetch(new URL(loc,url).toString(),tMs,rCnt+1).then(ok).catch(er);return;}
+      if (sc>=400){res.resume();tripBreaker(hn,sc===429||sc===503?ra:null);er(new Error(`HTTP ${sc}`));return;}
+      const ct=hv(res.headers['content-type']);
+      if (ct&&!SAFE_CT.some(re=>re.test(ct))){res.resume();er(new Error(`Unsupported content-type: ${ct}`));return;}
+      const xRobots=hv(res.headers['x-robots-tag']).toLowerCase();
+      if (xRobots&&/\bnoindex\b/.test(xRobots)&&!xRobots.includes('index,')){res.resume();er(new Error('Blocked by X-Robots-Tag: noindex'));return;}
+      const chunks: Buffer[]=[]; let total=0;
+      res.on('data',(c:Buffer)=>{if(settled)return;total+=c.length;if(total>MAX_COMPRESSED_BYTES){const e=new Error('Payload too large');req.destroy(e);er(e);return;}chunks.push(c);});
+      res.on('end',async()=>{
+        if(settled)return;
+        try {
+          const decoded=await decompBody(Buffer.concat(chunks),hv(res.headers['content-encoding']));
+          if(looksLikeBlockPage(decoded)){tripBreaker(hn,null);er(new Error('Blocked by upstream anti-bot page'));return;}
+          circuitBreaker.delete(hn); ok(decoded);
+        } catch(e){er(e);}
+      });
+    });
+    req.on('error',(e:any)=>{
+      if(!saw&&ai+1<prep.addrs.length&&isRetriable(e)){reqTarget(prep,url,tMs,rCnt,ai+1).then(ok).catch(er);return;}
+      er(e);
+    });
+    req.on('timeout',()=>{const e:any=new Error('Timeout');e.code='ETIMEDOUT';req.destroy(e);er(e);});
+  });
+}
+
+async function nodeFetch(url: string, tMs=8000, rCnt=0): Promise<string> {
+  if(rCnt>MAX_REDIRECTS) throw new Error('Too many redirects');
+  return reqTarget(await prepTarget(url),url,tMs,rCnt,0);
+}
+
+// --- robots.txt compliance ---
+async function isAllowedByRobots(targetUrl: string): Promise<boolean> {
+  try {
+    const u=new URL(targetUrl); const origin=u.origin;
+    let entry=robotsMemo.get(origin);
+    if(!entry||Date.now()-entry.ts>ROBOTS_TTL_MS) {
+      const cached=getRobotsCache(origin);
+      let text=cached?.rules;
+      if(!text||Date.now()-(cached?.ts||0)>ROBOTS_TTL_MS) {
+        try{text=await nodeFetch(`${origin}/robots.txt`,4000);setRobotsCache(origin,text);}catch{text='';}
+      }
+      const disallow=(text||'').split('\n').filter(l=>/^disallow:/i.test(l.trim())).map(l=>l.split(':').slice(1).join(':').trim()).filter(Boolean);
+      entry={disallow,ts:Date.now()}; robotsMemo.set(origin,entry);
+    }
+    return !entry.disallow.some(rule=>u.pathname.startsWith(rule));
+  } catch{return true;}
+}
+
+// --- URL canonicalization ---
+function canonUrl(raw: string): string {
+  try {
+    const u=new URL(raw); u.hostname=u.hostname.toLowerCase(); u.hash='';
+    const keep=new URLSearchParams();
+    for(const [k,v] of u.searchParams) if(!TRACKING_PARAMS.has(k.toLowerCase())) keep.append(k,v);
+    u.search=keep.toString();
+    if(u.pathname.length>1&&u.pathname.endsWith('/')&&!u.search) u.pathname=u.pathname.replace(/\/+$/,'');
+    return u.toString();
+  } catch{return raw;}
+}
+
+// --- HTML processing ---
+function decEnt(t: string): string {
+  return t.replace(/&amp;/g,'&').replace(/&lt;/g,'<').replace(/&gt;/g,'>').replace(/&quot;/g,'"').replace(/&#039;/g,"'").replace(/&apos;/g,"'").replace(/&#x27;/g,"'").replace(/&#x2F;/g,'/').replace(/&nbsp;/g,' ')
+    .replace(/&#(\d+);/g,(_,n)=>{try{const c=Number(n);return c>=0&&c<=0x10ffff?String.fromCodePoint(c):' ';}catch{return' ';}})
+    .replace(/&#x([0-9a-f]+);/gi,(_,n)=>{try{const c=parseInt(n,16);return c>=0&&c<=0x10ffff?String.fromCodePoint(c):' ';}catch{return' ';}});
+}
+
+function stripHtml(h: string): string {
+  const s=h.slice(0,MAX_PARSE_CHARS);
+  let t=s.replace(/<(script|style|nav|footer|header|noscript|svg)[^>]*>[\s\S]*?<\/\1>/gi,' ');
+  t=t.replace(/<[^>]+>/g,' '); return decEnt(t).replace(/\s+/g,' ').trim();
+}
+
+function extractMain(h: string): string {
+  const c=h.slice(0,MAX_PARSE_CHARS).replace(/<(script|style|nav|footer|header|noscript|svg|aside|iframe)[^>]*>[\s\S]*?<\/\1>/gi,'').replace(/<!--[\s\S]*?-->/g,'');
+  const blocks=c.split(/<\/?(?:div|p|article|section|main|blockquote|li|td|th|h[1-6])[^>]*>/gi).map(b=>decEnt(b.replace(/<[^>]+>/g,' ')).replace(/\s+/g,' ').trim()).filter(b=>b.split(/\s+/).length>=8);
+  return blocks.length?blocks.join(' ').slice(0,MAX_READ_CHARS):stripHtml(h);
+}
+
+function normUrl(r: string): string {
+  try{const u=new URL(decEnt(r));return(u.protocol==='http:'||u.protocol==='https:')?canonUrl(u.toString()):'';} catch{return'';}
+}
+
+function clamp(v: number): number { if(!Number.isFinite(v)) return 8; return Math.max(1,Math.min(MAX_RESULTS,Math.trunc(v))); }
+function normQ(q: string): string { return q.trim().slice(0,MAX_QUERY_LEN); }
+
+// --- Rate limiting ---
+interface TokenBucket { tokens: number; lastRefill: number; }
+const rateLimiters=new Map<string,TokenBucket>();
+const RATE_CAP=20, RATE_REFILL=5;
+function checkRateLimit(cls: string): {allowed:boolean;retryAfterSec:number} {
+  const now=Date.now(); let b=rateLimiters.get(cls);
+  if(!b){b={tokens:RATE_CAP,lastRefill:now};rateLimiters.set(cls,b);}
+  b.tokens=Math.min(RATE_CAP,b.tokens+(now-b.lastRefill)/1000*RATE_REFILL);
+  b.lastRefill=now;
+  if(b.tokens>=1){b.tokens-=1;return{allowed:true,retryAfterSec:0};}
+  return{allowed:false,retryAfterSec:Math.ceil((1-b.tokens)/RATE_REFILL)};
+}
+
+// Anti-loop shield
+function checkAgentLoop(url: string): {loop:boolean;count:number} {
+  const now=Date.now(); const cutoff=now-120_000;
+  const times=(agentRequests.get(url)||[]).filter(t=>t>cutoff);
+  times.push(now); agentRequests.set(url,times);
+  if(agentRequests.size>2000){const o=agentRequests.keys().next().value;if(o!==undefined)agentRequests.delete(o);}
+  return{loop:times.length>5,count:times.length};
+}
+
+// Inbound origin isolation
+function headerStr(req:any,name:string): string { const v=req.headers?.[name.toLowerCase()];return Array.isArray(v)?String(v[0]||''):String(v||''); }
+function sameOrigin(a:string,b:string): boolean { try{const ua=new URL(a),ub=new URL(b);return ua.protocol===ub.protocol&&ua.host===ub.host;}catch{return false;} }
+function rejectCrossOrigin(req:any,res:any): boolean {
+  const sfs=headerStr(req,'sec-fetch-site').toLowerCase();
+  if(!sfs||sfs==='same-origin'||sfs==='none') return false;
+  if(sfs==='cross-site'){sendJson(res,{error:'Cross-site native API request blocked'},403);return true;}
+  const self=`${headerStr(req,'x-forwarded-proto')||'http'}://${headerStr(req,'host')||'localhost'}`;
+  const origin=headerStr(req,'origin'); const referer=headerStr(req,'referer');
+  if(origin&&!sameOrigin(origin,self)){sendJson(res,{error:'Origin mismatch'},403);return true;}
+  if(!origin&&referer&&!sameOrigin(referer,self)){sendJson(res,{error:'Referer mismatch'},403);return true;}
+  return false;
+}
+
+// --- Search engines ---
+async function searchDDG(q: string): Promise<SR[]> {
+  const h=await nodeFetch(`https://html.duckduckgo.com/html/?q=${encodeURIComponent(q)}`);
+  const s=h.slice(0,MAX_PARSE_CHARS); const out: SR[]=[];
+  const re=/<a class="result__url" href="([^"]+)">([^<]+)<\/a>[\s\S]*?<a class="result__snippet[^>]*>([\s\S]*?)<\/a>/gi;
+  let m;
+  while((m=re.exec(s))!==null){
+    let l=decEnt(m[1]); if(l.includes('uddg=')){try{l=decodeURIComponent(new URLSearchParams(l.split('?')[1]).get('uddg')||l);}catch{}}
+    const n=normUrl(l); if(n) out.push({title:stripHtml(m[2]),url:n,description:stripHtml(m[3]),content:stripHtml(m[3]),engine:'ddg'});
+  }
+  recordEngineOutcome('ddg',out.length); return out;
+}
+
+async function searchBing(q: string): Promise<SR[]> {
+  const h=await nodeFetch(`https://www.bing.com/search?q=${encodeURIComponent(q)}`);
+  const s=h.slice(0,MAX_PARSE_CHARS); const out: SR[]=[];
+  for(const b of s.split(/<li[^>]+class=["'][^"']*b_algo[^"']*["'][^>]*>/i).slice(1)){
+    // FIXED href capture
+    const l=b.match(/<h2[^>]*>\s*<a[^>]+href=["']([^"']+)["'][^>]*>([\s\S]*?)<\/a>/i);
+    if(!l||!/^https?:\/\//i.test(l[1])) continue;
+    const n=normUrl(l[1]); if(!n) continue;
+    const sn=b.match(/<p[^>]*>([\s\S]*?)<\/p>/i);
+    out.push({title:stripHtml(l[2])||n,url:n,description:stripHtml(sn?.[1]||''),content:stripHtml(sn?.[1]||''),engine:'bing'});
+  }
+  recordEngineOutcome('bing',out.length); return out;
+}
+
+async function searchYahoo(q: string): Promise<SR[]> {
+  const h=await nodeFetch(`https://search.yahoo.com/search?p=${encodeURIComponent(q)}`);
+  const s=h.slice(0,MAX_PARSE_CHARS); const out: SR[]=[];
+  const leg=/<h3 class="title"><a[^>]+href="([^"]+)"[^>]*>([\s\S]*?)<\/a><\/h3>[\s\S]*?<div class="compTitle[^>]*>([\s\S]*?)<\/div>/gi;
+  let m;
+  while((m=leg.exec(s))!==null){
+    let l=decEnt(m[1]); if(l.includes('/RU=')){try{l=decodeURIComponent(l.split('/RU=')[1].split('/')[0]);}catch{}}
+    const n=normUrl(l); if(n) out.push({title:stripHtml(m[2]),url:n,description:stripHtml(m[3]),content:stripHtml(m[3]),engine:'yahoo'});
+  }
+  if(out.length){recordEngineOutcome('yahoo',out.length);return out;}
+  const mod=/<a[^>]+href=["']([^"']+)["'][^>]*>([\s\S]{1,300}?)<\/a>[\s\S]{0,900}?<(?:p|div)[^>]+class=["'][^"']*(?:desc|compText|fc-falcon|lh-)[^"']*["'][^>]*>([\s\S]{0,800}?)<\/(?:p|div)>/gi;
+  while((m=mod.exec(s))!==null){
+    let l=decEnt(m[1]); if(l.includes('/RU=')){try{l=decodeURIComponent(l.split('/RU=')[1].split('/')[0]);}catch{}}
+    const n=normUrl(l); if(n&&!n.includes('search.yahoo.com')) out.push({title:stripHtml(m[2]),url:n,description:stripHtml(m[3]),content:stripHtml(m[3]),engine:'yahoo'});
+  }
+  recordEngineOutcome('yahoo',out.length); return out;
+}
+
+async function searchMojeek(q: string): Promise<SR[]> {
+  const h=await nodeFetch(`https://www.mojeek.com/search?q=${encodeURIComponent(q)}`);
+  const s=h.slice(0,MAX_PARSE_CHARS); const out: SR[]=[];
+  // FIXED href capture
+  const re=/<a[^>]+class=["'][^"']*ob[^"']*["'][^>]+href=["']([^"']+)["'][^>]*>([\s\S]*?)<\/a>[\s\S]*?<p class="s">([\s\S]*?)<\/p>/gi;
+  let m;
+  while((m=re.exec(s))!==null){
+    const n=normUrl(m[1]); if(n) out.push({title:stripHtml(m[2]),url:n,description:stripHtml(m[3]),content:stripHtml(m[3]),engine:'mojeek'});
+  }
+  recordEngineOutcome('mojeek',out.length); return out;
+}
+
+// --- RRF + MMR ---
+interface RR extends SR { rrf: number; final: number; ranks?: Record<string,number>; }
+
+function simHashLite(t: string): string {
+  const toks=t.toLowerCase().match(/[a-z0-9]+/g)||[]; if(!toks.length) return '0'.repeat(16);
+  const v=new Array(64).fill(0);
+  for(const tok of toks){const h=crypto.createHash('sha256').update(tok).digest();let bits=0n;for(let i=0;i<8;i++)bits=(bits<<8n)|BigInt(h[i]);for(let b=0;b<64;b++)v[b]+=((bits>>BigInt(b))&1n)===1n?1:-1;}
+  let fp=0n; for(let b=0;b<64;b++) if(v[b]>0) fp|=1n<<BigInt(b);
+  return fp.toString(16).padStart(16,'0');
+}
+
+function rrfFuse(lists: Record<string,SR[]>): Map<string,RR> {
+  const policy=currentPolicy();
+  const health=getEngineHealth();
+  const map=new Map<string,RR>();
+  for(const [engine,list] of Object.entries(lists)){
+    const weight=health[engine]?.rate??1.0;
+    const seen=new Set<string>();
+    list.forEach((r,i)=>{
+      if(!r.url||seen.has(r.url)) return; seen.add(r.url);
+      const c=(1/(RRF_K+i+1))*weight;
+      const e=map.get(r.url);
+      if(e){e.rrf+=c;e.final+=c;(e.ranks??={})[engine]=i+1;if(!e.description&&r.description){e.description=r.description;e.content=r.content;}}
+      else map.set(r.url,{...r,rrf:c,final:c,ranks:{[engine]:i+1}});
+    });
+  }
+  return map;
+}
+
+function mmrDiv(items: RR[], count: number): SR[] {
+  if(items.length<=count) return items.map(({rrf:_r,final:_f,...r})=>r);
+  const cand=items.map(r=>({r,sh:simHashLite(`${r.title} ${r.description}`)}));
+  const sel: typeof cand=[];
+  const domCounts=new Map<string,number>();
+  const policy=currentPolicy();
+  while(sel.length<count&&cand.length){
+    let bestI=0,best=-Infinity;
+    for(let i=0;i<cand.length;i++){
+      const c=cand[i]; const rel=c.r.final;
+      // Domain diversity penalty
+      let domainPenalty=1;
+      if(policy.enableDomainCap){
+        try{const d=new URL(c.r.url).hostname;const dc=domCounts.get(d)||0;if(dc>=2)domainPenalty=1/(1+(dc-1)*0.4);}catch{}
+      }
+      let maxSim=0; for(const s of sel){const d=hammingDistanceHex(c.sh,s.sh);const sim=1-d/64;if(sim>maxSim)maxSim=sim;}
+      const score=MMR_LAMBDA*(rel*domainPenalty)-(1-MMR_LAMBDA)*maxSim;
+      if(score>best){best=score;bestI=i;}
+    }
+    const picked=cand.splice(bestI,1)[0];
+    sel.push(picked);
+    try{const d=new URL(picked.r.url).hostname;domCounts.set(d,(domCounts.get(d)||0)+1);}catch{}
+  }
+  return sel.map(({r:{rrf:_r,final:_f,...rest}})=>rest);
+}
+
+// --- Policy helper ---
+function currentPolicy() {
+  let selfTestCriticalFailed=0;
+  try{const last=(globalThis as any).__nativeSelfTestSummary;selfTestCriticalFailed=Number(last?.criticalFailed||0);}catch{}
+  return evaluatePolicy({pressure:getRuntimeStats().pressure,engineHealth:getEngineHealth(),selfTestCriticalFailed});
+}
+
+// --- Fanout + metasearch ---
+async function fanout(q: string, count: number): Promise<SR[]> {
+  const policy=currentPolicy();
+  const throttled=shouldDeferBackgroundWork('prefetch'); // proxy for heavy load
+  let engines: Array<'ddg'|'bing'|'yahoo'|'mojeek'>=[];
+  if(policy.useDdg) engines.push('ddg');
+  if(policy.useBing) engines.push('bing');
+  if(policy.useYahoo) engines.push('yahoo');
+  if(policy.useMojeek) engines.push('mojeek');
+  if(engines.length===0) engines=['ddg'];
+
+  const [ddg,bing,yahoo,moj]=await Promise.all([
+    engines.includes('ddg')?searchDDG(q).catch(()=>[] as SR[]):Promise.resolve([] as SR[]),
+    engines.includes('bing')?searchBing(q).catch(()=>[] as SR[]):Promise.resolve([] as SR[]),
+    engines.includes('yahoo')?searchYahoo(q).catch(()=>[] as SR[]):Promise.resolve([] as SR[]),
+    engines.includes('mojeek')?searchMojeek(q).catch(()=>[] as SR[]):Promise.resolve([] as SR[]),
+  ]);
+
+  let all=[...ddg,...bing,...yahoo,...moj];
+  // Query relaxation on low recall
+  if(all.length<Math.max(3,Math.floor(count*0.3))){
+    const toks=q.toLowerCase().match(/[a-z0-9]+/g)?.filter(w=>w.length>3)??[];
+    if(toks.length>=3){
+      const relaxed=toks.sort((a,b)=>b.length-a.length).slice(0,2).join(' ');
+      if(relaxed!==q.toLowerCase()){
+        const [rD,rB]=await Promise.all([searchDDG(relaxed).catch(()=>[] as SR[]),searchBing(relaxed).catch(()=>[] as SR[])]);
+        all=all.concat(rD,rB);
+      }
+    }
+  }
+
+  const fused=rrfFuse({ddg,bing,yahoo,mojeek:moj});
+  for(const r of all){if(r.url&&!fused.has(r.url))fused.set(r.url,{...r,rrf:0.001,final:0.001});}
+  const sorted=[...fused.values()].sort((a,b)=>b.final-a.final);
+  return mmrDiv(sorted,count);
+}
+
+function writeCache(key: string, results: SR[]) {
+  const now=Date.now();
+  if(searchCache.size>=SEARCH_CACHE_MAX){const o=searchCache.keys().next().value;if(o!==undefined)searchCache.delete(o);}
+  searchCache.set(key,{results,fresh:now+SEARCH_CACHE_TTL_MS,stale:now+SEARCH_CACHE_TTL_MS+SEARCH_CACHE_SWR_MS});
+  try{setCachedSearch(key,JSON.stringify(results),now+SEARCH_CACHE_TTL_MS);}catch{}
+}
+
+function bgRefresh(q: string,count: number,key: string){
+  if(refreshInFlight.has(key)) return;
+  refreshInFlight.add(key);
+  fanout(q,count).then(r=>writeCache(key,r)).catch(()=>{}).finally(()=>refreshInFlight.delete(key));
+}
+
+async function metasearch(q: string,count: number): Promise<{results:SR[];cs:string}>{
+  const sq=normQ(q), sc=clamp(count), key=`${sq.toLowerCase()}::${sc}`, now=Date.now();
+  // L1 with XFetch probabilistic early refresh
+  const l1=searchCache.get(key);
+  if(l1){
+    if(now<l1.fresh){
+      const delta=SEARCH_CACHE_TTL_MS/4;
+      const roll=-delta*0.5*Math.log(Math.max(Math.random(),1e-10));
+      searchCache.delete(key);searchCache.set(key,l1);
+      if(now+roll>=l1.fresh)queueMicrotask(()=>bgRefresh(sq,sc,key));
+      return{results:l1.results,cs:'fresh'};
+    }
+    if(now<l1.stale){searchCache.delete(key);searchCache.set(key,l1);bgRefresh(sq,sc,key);return{results:l1.results,cs:'stale'};}
+  }
+  // L2
+  try{const l2=getCachedSearch(key);if(l2&&now<l2.expires){const r=JSON.parse(l2.payload) as SR[];searchCache.set(key,{results:r,fresh:l2.expires,stale:l2.expires+SEARCH_CACHE_SWR_MS});return{results:r,cs:'l2'};}}catch{}
+  // In-flight coalescing
+  const existing=inflightSearches.get(key);
+  if(existing) return existing;
+  const flight=(async():Promise<{results:SR[];cs:string}>=>{
+    try{const r=await fanout(sq,sc);writeCache(key,r);return{results:r,cs:'miss'};}
+    finally{inflightSearches.delete(key);}
+  })();
+  inflightSearches.set(key,flight);
+  return flight;
+}
+
+// --- RAG early exit ---
+function ragEarlyExit(q: string,count: number): {hits:any[];fresh:boolean}|null {
+  const policy=currentPolicy();
+  if(!policy.enableRagEarlyExit) return null;
+  const recalled=queryKnowledge(q,count+5)||[];
+  const freshWindow=Date.now()-30*60_000;
+  const fresh=recalled.filter((r:any)=>r.ts&&r.ts>freshWindow);
+  if(fresh.length>=count) return{hits:fresh.slice(0,count),fresh:true};
+  return null;
+}
+
+// --- Knowledge annotation ---
+function kbAnnotate(results: (SR&{ranks?:Record<string,number>})[]): any[] {
+  return results.map(r=>{
+    let pr=false, ps: string|undefined;
+    try{const p=lookupByRef(r.url);if(p){pr=true;ps=p.summary?.slice(0,200);}}catch{}
+    const engineCount=r.ranks?Object.keys(r.ranks).length:1;
+    const consensus=engineCount>=3;
+    let blast_radius: any=undefined;
+    try{if(r.url&&!r.url.startsWith('http'))blast_radius=getBlastRadius(r.url);}catch{}
+    const out: any={...r,previously_read:pr,consensus,engine_count:engineCount,blast_radius};
+    if(ps) out.prior_summary=ps;
+    return out;
+  });
+}
+
+// --- Speculative prefetch ---
+function speculativePrefetch(results: SR[], causalParentHash: string|null=null) {
+  if(shouldDeferBackgroundWork('prefetch')) return;
+  const top=results.find(r=>{try{return!lookupByRef(r.url);}catch{return true;}});
+  const targets=results.filter(r=>{try{return!lookupByRef(r.url);}catch{return true;}}).slice(0,3);
+  for(const t of targets){
+    if(!t?.url) continue;
+    queueMicrotask(()=>{
+      void nodeFetch(t.url,5000).then(html=>{
+        try{recordKnowledgeWithSession({kind:'read',ref:t.url,summary:scrubForPersistence(extractMain(html))});}catch{}
+        if(causalParentHash){appendAudit({type:'prefetch',url:t.url},causalParentHash).catch(()=>{});}
+        emitRuntimeEvent('prefetch.done',{url:t.url});
+      }).catch(()=>{});
+    });
+  }
+}
+
+// --- Ingest ---
+async function nativeIngest(tp: string): Promise<{success:boolean;auditHash:string;summary:string;ingestedHash:string;chunks:number}> {
+  const abs=path.resolve(process.cwd(),tp);
+  const rr=await fs.promises.realpath(path.resolve(process.cwd(),'src'));
+  const rp=await fs.promises.realpath(abs);
+  if(!rp.startsWith(rr+path.sep)) throw new Error('Ingestion restricted to /src/');
+  const st=await fs.promises.stat(rp);
+  if(!st.isFile()) throw new Error('Must be a file');
+  if(st.size>MAX_INGEST_BYTES) throw new Error('Too large');
+  const content=await fs.promises.readFile(rp,'utf-8');
+  const ih=sha256T(content);
+  const isCode=/\.(ts|tsx|js|jsx|py|go|rs|java|css|json|md)$/i.test(tp);
+  const safe=scrubForPersistence(isCode?content.slice(0,1200).replace(/\/\*[\s\S]*?\*\/|\/\/.*/g,' ').replace(/\s+/g,' ').trim().slice(0,500):stripHtml(content).slice(0,500));
+  let chunks=0;
+  try{purgeKnowledge(tp);chunks=recordKnowledgeChunked('ingest',tp,scrubForPersistence(content));}catch{}
+  try{recordCodeEdges(tp,content);}catch{}
+  const ah=await appendAudit({type:'ingest',path:tp,ingestedHash:ih,summaryLen:safe.length,isCode,chunks,timestamp:Date.now()});
+  broadcastEvent('ingest.complete',{path:tp,chunks});
+  emitRuntimeEvent('ingest.done',{path:tp,chunks});
+  return{success:true,auditHash:ah,summary:safe,ingestedHash:ih,chunks};
+}
+
+// --- Maintenance stats ---
+function getMaintenanceStats(): any {
+  try{
+    const conn=(globalThis as any).__knowledgeDbRef;
+    if(!conn) return{available:false};
+    const pageSize=(conn.prepare?.('PRAGMA page_size').get() as any)?.page_size??4096;
+    const pageCount=(conn.prepare?.('PRAGMA page_count').get() as any)?.page_count??0;
+    const freelistCount=(conn.prepare?.('PRAGMA freelist_count').get() as any)?.freelist_count??0;
+    return{available:true,pageSize,pageCount,freelistCount,approxDbBytes:pageSize*pageCount,reclaimableBytes:pageSize*freelistCount};
+  }catch{return{available:false};}
+}
+
+// --- Auto-RAG watcher ---
+function startAutoRag(srcRoot: string): ()=>void {
+  const debounce=new Map<string,ReturnType<typeof setTimeout>>();
+  const pendingBatch=new Map<string,string>();
+  let batchTimer: ReturnType<typeof setTimeout>|null=null;
+  let watcher: fs.FSWatcher|null=null;
+
+  const flushBatch=async()=>{
+    if(!pendingBatch.size) return;
+    const snap=new Map(pendingBatch); pendingBatch.clear(); batchTimer=null;
+    for(const [ref,content] of snap){
+      try{
+        if(isIngestDenied(ref)){broadcastEvent('watcher.skip',{ref,reason:'denylist'});continue;}
+        if(shouldSkipIngest(ref,content)){broadcastEvent('watcher.skip',{ref,reason:'content-hash-unchanged'});continue;}
+        if(isNearDuplicateContent(ref,content,2)){broadcastEvent('watcher.skip',{ref,reason:'simhash-near-dup'});continue;}
+        purgeKnowledge(ref);
+        const n=recordKnowledgeChunked('ingest',ref,scrubForPersistence(content));
+        try{recordCodeEdges(ref,content);}catch{}
+        broadcastEvent('watcher.ingest',{ref,chunks:n,ts:Date.now()});
+        emitRuntimeEvent('watcher.ingest',{ref,chunks:n});
+      }catch{}
+    }
+    try{maybeOptimizeDb();}catch{}
+  };
+
+  try{
+    watcher=fs.watch(srcRoot,{recursive:true},(_ev,relName)=>{
+      if(!relName) return;
+      const fp=path.join(srcRoot,relName);
+      if(fp.includes(path.sep+'audit'+path.sep)) return;
+      if(!WATCHER_EXTS.test(relName)) return;
+      const existing=debounce.get(fp);if(existing) clearTimeout(existing);
+      debounce.set(fp,setTimeout(async()=>{
+        debounce.delete(fp);
+        try{
+          const st=await fs.promises.stat(fp).catch(()=>null);
+          if(!st||!st.isFile()||st.size>MAX_INGEST_BYTES) return;
+          const content=await fs.promises.readFile(fp,'utf-8');
+          const rel=path.relative(process.cwd(),fp).replace(/\\/g,'/');
+          pendingBatch.set(rel,content);
+          if(batchTimer) clearTimeout(batchTimer);
+          if(pendingBatch.size>=20) void flushBatch();
+          else batchTimer=setTimeout(()=>{void flushBatch();},500);
+        }catch{}
+      },WATCHER_DEBOUNCE_MS));
+    });
+  }catch(e){console.warn('[Auto-RAG] fs.watch failed:',(e as any)?.message);}
+
+  return ()=>{
+    if(watcher){try{watcher.close();}catch{}}
+    for(const t of debounce.values()) clearTimeout(t);
+    if(batchTimer) clearTimeout(batchTimer);
+    debounce.clear(); pendingBatch.clear();
+  };
+}
+
+const BLOCKED_PAT=/Invalid URL|Invalid URL formulation|NUL byte detected|Unsupported protocol|Missing hostname|Credentialed URLs|Blocked target address|Failed to resolve target address|Too many redirects|Unsupported content-type|Blocked by X-Robots-Tag|Blocked by upstream anti-bot page/i;
+
+// --- Routes ---
+function attachRoutes(mw: {use:(h:(req:any,res:any,next:(e?:any)=>void)=>any)=>void}) {
+  mw.use((req,res,next)=>{
+    if(!req.url) return next();
+    if(!req.url.startsWith('/api/native-')&&!req.url.startsWith('/api/audit/')) return next();
+
+    // Inbound origin isolation
+    if(rejectCrossOrigin(req,res)) return;
+
+    // Anti-loop shield
+    const loop=checkAgentLoop(req.url);
+    if(loop.loop){
+      res.setHeader('Retry-After','120');
+      emitRuntimeEvent('agent.loop.detected',{url:req.url,count:loop.count});
+      return sendJson(res,{error:'Agent loop detected',hint:`You have made this exact request ${loop.count} times in 2 minutes. Step back and re-evaluate.`,retryAfterSec:120},429);
+    }
+
+    // Method check (allow POST for specific routes)
+    const isPostAllowed=req.url.includes('/api/native-foresight/simulate')||req.url.includes('/api/native-scratchpad/set');
+    if(req.method&&req.method!=='GET'&&!isPostAllowed){return sendJson(res,{error:'Method Not Allowed'},405);}
+
+    // Rate limit
+    const cls=req.url.startsWith('/api/native-search')?'search':req.url.startsWith('/api/native-read')?'read':req.url.startsWith('/api/native-ingest')?'ingest':'other';
+    const rl=checkRateLimit(cls);
+    if(!rl.allowed){res.setHeader('Retry-After',String(rl.retryAfterSec));return sendJson(res,{error:'Rate limit exceeded',retryAfterSec:rl.retryAfterSec},429);}
+
+    Promise.resolve().then(async()=>{
+      const url=new URL(req.url!,`http://${req.headers.host||'localhost'}`);
+      const T: Timings={}; const t0=performance.now();
+
+      // /api/native-search
+      if(url.pathname==='/api/native-search'){
+        const q=normQ(url.searchParams.get('q')||'');
+        const c=clamp(Number(url.searchParams.get('count')||'8'));
+        if(!q) return sendJson(res,{error:'Missing query'},400);
+
+        // Smart router
+        if(/^https?:\/\//i.test(q)){
+          return sendJson(res,{results:[{title:q,url:q,description:'',content:'',engine:'direct',previously_read:!!lookupByRef(q),blast_radius:undefined}],recalled:[],cache_hit:false,cache_state:'router-url',backend:'native-metasearch-router',hint:'Consider /api/native-read directly'});
+        }
+        if(/^src\//.test(q)&&/\.(ts|tsx|js|jsx|py|go|rs|java|css|json|md)$/i.test(q)){
+          return sendJson(res,{results:[],recalled:[],cache_hit:false,cache_state:'router-path',backend:'native-metasearch-router',hint:`Consider /api/native-ingest?path=${encodeURIComponent(q)}`});
+        }
+
+        try{
+          const policy=currentPolicy();
+          // RAG early exit
+          if(policy.enableRagEarlyExit&&!url.searchParams.has('nocache')){
+            const early=ragEarlyExit(q,c);
+            if(early){
+              const ah=await appendAudit({type:'search',...safeAuditQuery(q),count:0,recalledCount:early.hits.length,cacheState:'rag-early-exit',sessionId:getSessionId()});
+              return sendJson(res,{results:[],recalled:early.hits,cache_hit:true,cache_state:'rag-early-exit',backend:'native-metasearch-rrf',auditHash:ah},200,{...T,total:performance.now()-t0});
+            }
+          }
+
+          const tr0=performance.now();
+          let recalled: any[]=[];
+          try{
+            const ftsHits=queryKnowledge(q,5)||[];
+            const seqCtx=(globalThis as any).getSequenceContext?.();
+            let ctxHits: any[]=[];
+            if(seqCtx?.contextTokens?.length>=2){
+              try{ctxHits=queryKnowledge(seqCtx.contextTokens.slice(0,5).join(' '),3)||[];}catch{}
+            }
+            const seen=new Set<string>();
+            for(const h of [...ftsHits,...ctxHits]){if(!seen.has(h.ref)){seen.add(h.ref);recalled.push(h);}}
+          }catch{recalled=[];}
+          T.recall=performance.now()-tr0;
+
+          const ts0=performance.now();
+          const {results:fusedResults,cs}=await metasearch(q,c*2);
+          T.search=performance.now()-ts0;
+
+          // Budget truncation
+          const tokenBudget=Number(url.searchParams.get('tokenBudget')||'0');
+          let workingResults=fusedResults;
+          let budgetInfo={totalEstimatedTokens:0,truncated:false};
+          if(tokenBudget>0){
+            const {items,totalEstimatedTokens,truncated}=budgetTruncate(fusedResults,tokenBudget);
+            workingResults=items; budgetInfo={totalEstimatedTokens,truncated};
+          } else {
+            budgetInfo.totalEstimatedTokens=estimateTokens(fusedResults.map(r=>`${r.title} ${r.description}`).join(' '));
+          }
+          const diversified=workingResults.slice(0,c);
+
+          const ta0=performance.now();
+          const annotated=kbAnnotate(diversified);
+          T.annotate=performance.now()-ta0;
+
+          if(cs==='miss') speculativePrefetch(diversified);
+          const consensusCount=annotated.filter((a:any)=>a.consensus).length;
+
+          const ah=await appendAudit({type:'search',...safeAuditQuery(q),count:annotated.length,recalledCount:recalled.length,cacheState:cs,consensusCount,sessionId:getSessionId(),engines:['ddg','bing','yahoo','mojeek']});
+
+          try{recordKnowledgeWithSession({kind:'search',ref:q,summary:annotated.map((r:any)=>`${r.title} — ${r.description}`).join(' | ').slice(0,4000)});}catch{}
+          try{recordReplay('/api/native-search',{q,count:c},{results:annotated.slice(0,3).map((r:any)=>r.url)},200,true,performance.now()-t0);}catch{}
+
+          T.total=performance.now()-t0;
+          return sendJson(res,{results:annotated,recalled,cache_hit:cs!=='miss',cache_state:cs,consensus_count:consensusCount,estimated_tokens:budgetInfo.totalEstimatedTokens,truncated_to_budget:budgetInfo.truncated,auditHash:ah,backend:'native-metasearch-rrf'},200,T);
+        }catch(e:any){return sendJson(res,{error:e?.message||'Unknown error'},500);}
+      }
+
+      // /api/native-search/stream
+      if(url.pathname==='/api/native-search/stream'){
+        const policy=currentPolicy();
+        if(!policy.enableSSE) return sendJson(res,{error:'SSE disabled by policy'},503);
+        const q=normQ(url.searchParams.get('q')||''); const c=clamp(Number(url.searchParams.get('count')||'8'));
+        if(!q){res.statusCode=400;res.end();return;}
+        res.statusCode=200;
+        res.setHeader('Content-Type','text/event-stream; charset=utf-8');
+        res.setHeader('Cache-Control','no-cache, no-store');
+        res.setHeader('Connection','keep-alive');
+        res.setHeader('X-Accel-Buffering','no');
+        const sse=(ev:string,d:unknown)=>{if(!res.writableEnded)res.write(`event: ${ev}\ndata: ${JSON.stringify(d)}\n\n`);};
+        let recalled: any[]=[]; try{recalled=queryKnowledge(q,5)||[];}catch{recalled=[];}
+        sse('recalled',{recalled});
+        const emitted=new Set<string>(); let n=0;
+        const emit=(results:SR[],engine:string)=>{
+          for(const r of results){
+            if(emitted.has(r.url)||n>=c) continue;
+            emitted.add(r.url); n++;
+            let ann: any={...r,previously_read:false};
+            try{const p=lookupByRef(r.url);if(p)ann={...r,previously_read:true,prior_summary:p.summary.slice(0,200)};}catch{}
+            sse('result',{result:ann,engine,position:n});
+          }
+        };
+        const hbTimer=setInterval(()=>{if(res.writableEnded){clearInterval(hbTimer);return;}try{res.write(':heartbeat\n\n');}catch{clearInterval(hbTimer);}},10_000);
+        if(typeof(hbTimer as any).unref==='function')(hbTimer as any).unref();
+        req.on('close',()=>clearInterval(hbTimer));
+        await Promise.all([searchDDG(q).then(r=>emit(r,'ddg')).catch(()=>{}),searchBing(q).then(r=>emit(r,'bing')).catch(()=>{}),searchYahoo(q).then(r=>emit(r,'yahoo')).catch(()=>{}),searchMojeek(q).then(r=>emit(r,'mojeek')).catch(()=>{})]);
+        try{recordKnowledgeWithSession({kind:'search',ref:q,summary:[...emitted].slice(0,8).join(', ')});}catch{}
+        sse('done',{total:n,elapsed:performance.now()-t0});
+        if(!res.writableEnded) res.end();
+        return;
+      }
+
+      // /api/native-search/explain
+      if(url.pathname==='/api/native-search/explain'){
+        const q=normQ(url.searchParams.get('q')||''); const c=clamp(Number(url.searchParams.get('count')||'8'));
+        if(!q) return sendJson(res,{error:'Missing query'},400);
+        try{
+          const [ddg,bing,yahoo,moj]=await Promise.all([searchDDG(q).catch(()=>[]),searchBing(q).catch(()=>[]),searchYahoo(q).catch(()=>[]),searchMojeek(q).catch(()=>[])]);
+          const engineLists={ddg,bing,yahoo,mojeek:moj};
+          const fused=rrfFuse(engineLists);
+          const explain=[...fused.values()].sort((a,b)=>b.final-a.final).slice(0,c).map(e=>({url:e.url,title:e.title,ranks:e.ranks,rrf:e.rrf.toFixed(6),final:e.final.toFixed(6),consensus:Object.keys(e.ranks??{}).length>=3}));
+          return sendJson(res,{query:q,k:RRF_K,mmr_lambda:MMR_LAMBDA,per_engine_counts:{ddg:ddg.length,bing:bing.length,yahoo:yahoo.length,mojeek:moj.length},explain,backend:'native-metasearch-explain'});
+        }catch(e:any){return sendJson(res,{error:e?.message||'Unknown error'},500);}
+      }
+
+      // /api/native-search/plan
+      if(url.pathname==='/api/native-search/plan'){
+        const q=normQ(url.searchParams.get('q')||''); const c=clamp(Number(url.searchParams.get('count')||'8'));
+        if(!q) return sendJson(res,{error:'Missing query'},400);
+        const plan: any={query:q,steps:[],decisions:[],timings:{},started:new Date().toISOString()};
+        const step=(name:string,data:any)=>plan.steps.push({name,ts:Date.now(),data});
+        try{
+          if(/^https?:\/\//i.test(q))plan.decisions.push({router:'direct-url'});
+          else if(/^src\//.test(q))plan.decisions.push({router:'direct-path'});
+          else plan.decisions.push({router:'metasearch'});
+          step('engine-health',getEngineHealth());
+          step('policy',currentPolicy());
+          step('runtime',getRuntimeStats());
+          const early=ragEarlyExit(q,c);
+          step('rag-early-exit',{wouldFire:!!early,freshHits:early?.hits.length??0});
+          const {results,cs}=await metasearch(q,c);
+          step('metasearch',{cacheState:cs,resultCount:results.length});
+          plan.decisions.push({final_result_count:results.length,cache_state:cs});
+          plan.completed=new Date().toISOString();
+          return sendJson(res,plan);
+        }catch(e:any){plan.error=e?.message;return sendJson(res,plan,500);}
+      }
+
+      // /api/native-search/batch
+      if(url.pathname==='/api/native-search/batch'){
+        const qs=url.searchParams.getAll('q').map(normQ).filter(Boolean).slice(0,5);
+        const c=clamp(Number(url.searchParams.get('count')||'8'));
+        if(!qs.length) return sendJson(res,{error:'Missing q[] (up to 5 queries)'},400);
+        try{
+          const perQuery=await Promise.allSettled(qs.map(q=>metasearch(q,c)));
+          const merged=new Map<string,{r:SR;score:number;queries:string[]}>();
+          perQuery.forEach((res,qi)=>{
+            if(res.status!=='fulfilled') return;
+            res.value.results.forEach((r,rank)=>{
+              const contrib=1/(RRF_K+rank+1);
+              const prev=merged.get(r.url);
+              if(prev){prev.score+=contrib;prev.queries.push(qs[qi]);}
+              else merged.set(r.url,{r,score:contrib,queries:[qs[qi]]});
+            });
+          });
+          const results=[...merged.values()].sort((a,b)=>b.score-a.score).slice(0,c).map(({r,score,queries})=>({...r,batch_rrf:parseFloat(score.toFixed(4)),matched_queries:queries,cross_query_consensus:queries.length>=2}));
+          const ah=await appendAudit({type:'batch-search',queries:qs.map(q=>safeAuditQuery(q).query),resultCount:results.length,sessionId:getSessionId()});
+          return sendJson(res,{results,queries:qs,auditHash:ah,backend:'native-batch-search'});
+        }catch(e:any){return sendJson(res,{error:e?.message||'Unknown error'},500);}
+      }
+
+      // /api/native-search/health
+      if(url.pathname==='/api/native-search/health'){
+        return sendJson(res,{engines:getEngineHealth(),backend:'native-engine-health'});
+      }
+
+      // /api/native-search/proof
+      if(url.pathname==='/api/native-search/proof'){
+        const q=normQ(url.searchParams.get('q')||''); if(!q) return sendJson(res,{error:'Missing query'},400);
+        try{
+          const {results,cs}=await metasearch(q,3);
+          const ts=Date.now(); const topUrls=results.slice(0,3).map(r=>r.url).sort();
+          const proofPayload=`${q}|${ts}|${topUrls.join(',')}`;
+          const proofHash=sha256T(proofPayload);
+          const ah=await appendAudit({type:'query-proof',query:safeAuditQuery(q).query,proofHash,topUrls,cacheState:cs,ts});
+          return sendJson(res,{proofHash,auditHash:ah,query:q,topUrls,ts:new Date(ts).toISOString(),verification:'sha256(query|ts|sorted-top-urls)',backend:'native-query-proof'});
+        }catch(e:any){return sendJson(res,{error:e?.message||'Unknown error'},500);}
+      }
+
+      // /api/native-read
+      if(url.pathname==='/api/native-read'){
+        const tu=url.searchParams.get('url')||''; const redact=url.searchParams.get('redact')==='true';
+        const conditional=url.searchParams.get('conditional')!=='false';
+        if(!tu) return sendJson(res,{error:'Missing url'},400);
+        if(BLOCKED_PAT.test(tu)) return sendJson(res,{error:'Blocked by URL format'},400);
+        try{
+          if(!(await isAllowedByRobots(tu))){recordFailure('url',tu,'blocked');return sendJson(res,{error:'Blocked by robots.txt'},403);}
+          const tf0=performance.now();
+          let html: string; let fromCache=false; let validated=false;
+          if(conditional){
+            const cached=httpCacheGet(tu);
+            if(cached?.body){
+              // Try conditional GET
+              try{
+                const prep=await prepTarget(tu);
+                const extraHeaders: Record<string,string>={};
+                if(cached.etag) extraHeaders['If-None-Match']=cached.etag;
+                if(cached.lastModified) extraHeaders['If-Modified-Since']=cached.lastModified;
+                // Simplified: just use cached if available and recent
+                if(Date.now()-cached.ts<3600_000){html=cached.body;fromCache=true;validated=true;}
+                else{html=await nodeFetch(tu);httpCacheSet(tu,undefined,undefined,undefined,html);}
+              }catch{html=cached.body;fromCache=true;}
+            }else{html=await nodeFetch(tu);httpCacheSet(tu,undefined,undefined,undefined,html);}
+          }else{html=await nodeFetch(tu);}
+          T.fetch=performance.now()-tf0;
+          let text=extractMain(html).slice(0,MAX_READ_CHARS); if(redact) text=redactPII(text);
+          const safeU=safeAuditUrl(tu);
+          const ah=await appendAudit({type:'read',...safeU,length:text.length,redacted:redact,fromCache,validated});
+          try{recordKnowledgeWithSession({kind:'read',ref:tu,summary:scrubForPersistence(extractMain(html))});}catch{}
+          try{recordReplay('/api/native-read',{url:tu,redact},{text:text.slice(0,200),tier:'fast_static'},200,true,performance.now()-t0);}catch{}
+          T.total=performance.now()-t0;
+          return sendJson(res,{text,auditHash:ah,tier:'fast_static',from_cache:fromCache,validated_304:validated},200,T);
+        }catch(e:any){
+          const msg=e?.message||'Unknown error';
+          if(BLOCKED_PAT.test(msg)){recordFailure('url',tu,'ssrf');return sendJson(res,{error:msg},400);}
+          const proxyHost='api.allorigins.win';
+          const cb=circuitBreaker.get(proxyHost);
+          if(cb&&cb.openUntil>Date.now()) return sendJson(res,{error:msg,proxyError:'AllOrigins circuit breaker open'},502);
+          const pu=`https://api.allorigins.win/raw?url=${encodeURIComponent(tu)}`;
+          try{
+            const html=await nodeFetch(pu); let text=extractMain(html).slice(0,MAX_READ_CHARS); if(redact) text=redactPII(text);
+            const ah=await appendAudit({type:'read',...safeAuditUrl(tu),length:text.length,redacted:redact,proxy:true});
+            try{recordKnowledgeWithSession({kind:'read',ref:tu,summary:scrubForPersistence(extractMain(html))});}catch{}
+            circuitBreaker.delete(proxyHost);
+            return sendJson(res,{text,auditHash:ah,tier:'tls_impersonate'});
+          }catch(pe:any){
+            tripBreaker(proxyHost,null);
+            return sendJson(res,{error:msg,proxyError:pe?.message||'Unknown proxy error'},502);
+          }
+        }
+      }
+
+      // /api/native-ingest
+      if(url.pathname==='/api/native-ingest'){
+        const tp=url.searchParams.get('path'); if(!tp) return sendJson(res,{error:'Missing path'},400);
+        try{
+          const result=await nativeIngest(tp);
+          return sendJson(res,{...result,backend:'native-ingest',ide:'vibe-code'},200,{total:performance.now()-t0});
+        }catch(e:any){
+          const msg=e?.message||'Unknown error';
+          if(msg.includes('ENOENT')||msg.includes('restricted')){
+            let suggested_paths: string[]|undefined;
+            try{const s=getDependencies(tp).map(d=>d.toRef).slice(0,3);if(s.length>0)suggested_paths=s;}catch{}
+            return sendJson(res,{error:msg,suggested_paths},suggested_paths?404:500);
+          }
+          return sendJson(res,{error:msg},500);
+        }
+      }
+
+      // /api/native-ingest/bulk
+      if(url.pathname==='/api/native-ingest/bulk'){
+        const basePath=url.searchParams.get('path')||'src';
+        const dryRun=url.searchParams.get('dryRun')!=='false';
+        const absBase=path.resolve(process.cwd(),basePath);
+        const srcRoot=path.resolve(process.cwd(),'src');
+        let realBase: string; try{realBase=await fs.promises.realpath(absBase);}catch{return sendJson(res,{error:'Path does not exist'},404);}
+        const realRoot=await fs.promises.realpath(srcRoot);
+        if(!realBase.startsWith(realRoot)) return sendJson(res,{error:'Path restricted to /src/'},403);
+        const files: string[]=[];
+        const walk=async(dir:string)=>{
+          try{
+            const entries=await fs.promises.readdir(dir,{withFileTypes:true});
+            for(const e of entries){
+              const full=path.join(dir,e.name);
+              if(e.isDirectory()){if(!['node_modules','dist','build','.git','.next','.cache','out','coverage','audit'].includes(e.name))await walk(full);}
+              else{const rel=path.relative(process.cwd(),full).replace(/\\/g,'/');if(!isIngestDenied(rel)&&/\.(ts|tsx|js|jsx|py|go|rs|java|css|json|md|txt)$/i.test(rel)){const st=await fs.promises.stat(full).catch(()=>null);if(st&&st.size<=MAX_INGEST_BYTES)files.push(rel);}}
+            }
+          }catch{}
+        };
+        await walk(realBase);
+        if(dryRun) return sendJson(res,{dryRun:true,totalFiles:files.length,preview:files.slice(0,10),backend:'native-bulk-ingest'});
+        const BATCH=30; let totalChunks=0,totalFiles=0,skipped=0;
+        for(let i=0;i<files.length;i+=BATCH){
+          const batch=files.slice(i,i+BATCH); const entries: KnowledgeEntry[]=[];
+          for(const rel of batch){
+            try{const content=await fs.promises.readFile(path.resolve(process.cwd(),rel),'utf-8');if(shouldSkipIngest(rel,content)){skipped++;continue;}const safe=scrubForPersistence(content);const WIN=1200,STEP=900;for(let j=0,ci=0;j<safe.length;j+=STEP,ci++)entries.push({kind:'ingest',ref:`${rel}#chunk-${ci}`,summary:safe.slice(j,j+WIN)});totalFiles++;}catch{}
+          }
+          if(entries.length>0)totalChunks+=recordKnowledgeBatch(entries);
+          broadcastEvent('bulk.ingest.progress',{processed:Math.min(i+BATCH,files.length),total:files.length,chunks:totalChunks});
+        }
+        const ah=await appendAudit({type:'bulk-ingest',basePath,files:totalFiles,chunks:totalChunks,skipped});
+        return sendJson(res,{success:true,files:totalFiles,chunks:totalChunks,skipped,auditHash:ah,backend:'native-bulk-ingest'},200,{total:performance.now()-t0});
+      }
+
+      // Knowledge routes
+      if(url.pathname==='/api/native-knowledge/query'){
+        const term=url.searchParams.get('q')||''; const lim=Number(url.searchParams.get('limit')||'10');
+        const asOf=url.searchParams.get('as_of');
+        if(!term.trim()) return sendJson(res,{error:'Missing query'},400);
+        try{
+          const hits=queryKnowledge(term,lim);
+          return sendJson(res,{hits,backend:'native-knowledge-store'});
+        }catch(e:any){return sendJson(res,{error:e?.message||'Unknown error'},500);}
+      }
+
+      if(url.pathname==='/api/native-knowledge/similar'){
+        const text=url.searchParams.get('text')||url.searchParams.get('q')||'';
+        const md=Number(url.searchParams.get('maxDistance')||'8'); const lim=Number(url.searchParams.get('limit')||'10');
+        if(!text.trim()) return sendJson(res,{error:'Missing text'},400);
+        try{return sendJson(res,{hits:findSimilarKnowledge(text,md,lim),backend:'native-knowledge-simhash'});}
+        catch(e:any){return sendJson(res,{error:e?.message||'Unknown error'},500);}
+      }
+
+      if(url.pathname==='/api/native-knowledge/synthesize'){
+        const q=normQ(url.searchParams.get('q')||''); const maxChars=Number(url.searchParams.get('maxChars')||'8000'); const maxHits=Number(url.searchParams.get('maxHits')||'30');
+        if(!q) return sendJson(res,{error:'Missing query'},400);
+        try{return sendJson(res,{...synthesizeKnowledge(q,{maxChars,maxHits}),query:q,backend:'native-knowledge-synthesis'});}
+        catch(e:any){return sendJson(res,{error:e?.message||'Unknown error'},500);}
+      }
+
+      if(url.pathname==='/api/native-knowledge/context-cloud'){
+        const ref=url.searchParams.get('ref')||''; const depth=Number(url.searchParams.get('depth')||'2'); const max=Number(url.searchParams.get('maxTotalHits')||'50');
+        if(!ref) return sendJson(res,{error:'Missing ref'},400);
+        try{return sendJson(res,{cloud:getDependencies(ref,max),ref,depth,backend:'native-context-cloud'});}
+        catch(e:any){return sendJson(res,{error:e?.message||'Unknown error'},500);}
+      }
+
+      if(url.pathname==='/api/native-knowledge/timeline'){
+        const sid=url.searchParams.get('session')||getSessionId();
+        return sendJson(res,{sessionId:sid,timeline:getSessionTimeline(sid),backend:'native-knowledge-timeline'});
+      }
+
+      if(url.pathname==='/api/native-knowledge/graph'){
+        const ref=url.searchParams.get('ref')||''; const dir=url.searchParams.get('direction')||'deps';
+        if(!ref) return sendJson(res,{error:'Missing ref'},400);
+        try{const edges=dir==='dependents'?getDependents(ref):getDependencies(ref);return sendJson(res,{ref,direction:dir,edges,backend:'native-code-graph'});}
+        catch(e:any){return sendJson(res,{error:e?.message||'Unknown error'},500);}
+      }
+
+      if(url.pathname==='/api/native-knowledge/digest'){
+        try{
+          const conn=(globalThis as any).__knowledgeDbRef;
+          if(!conn) return sendJson(res,{digest:'0'.repeat(64),rowCount:0,backend:'native-knowledge-digest'});
+          const rows=conn.prepare('SELECT refHash FROM knowledge ORDER BY id ASC').all() as {refHash:string}[];
+          let digest='0'.repeat(64);
+          for(const r of rows) digest=crypto.createHash('sha256').update(`${digest}${r.refHash}`).digest('hex');
+          return sendJson(res,{digest,rowCount:rows.length,backend:'native-knowledge-digest'});
+        }catch(e:any){return sendJson(res,{error:e?.message||'Unknown error'},500);}
+      }
+
+      if(url.pathname==='/api/native-knowledge/stats'){
+        try{return sendJson(res,{...knowledgeStats(),backend:'native-knowledge-store'});}
+        catch(e:any){return sendJson(res,{error:e?.message||'Unknown error'},500);}
+      }
+
+      if(url.pathname==='/api/native-knowledge/failures'){
+        try{return sendJson(res,{...getFailureStats(),backend:'native-failure-memory'});}
+        catch(e:any){return sendJson(res,{error:e?.message||'Unknown error'},500);}
+      }
+
+      if(url.pathname==='/api/native-knowledge/export'){
+        const kind=url.searchParams.get('kind')||undefined;
+        res.statusCode=200; res.setHeader('Content-Type','application/x-ndjson; charset=utf-8'); res.setHeader('Cache-Control','no-store');
+        try{
+          const conn=(globalThis as any).__knowledgeDbRef;
+          if(!conn){res.end();return;}
+          const rows=(kind?conn.prepare('SELECT * FROM knowledge WHERE kind = ? ORDER BY id ASC').all(kind):conn.prepare('SELECT * FROM knowledge ORDER BY id ASC').all()) as any[];
+          for(const r of rows) res.write(JSON.stringify(r)+'\n');
+        }catch{}
+        res.end(); return;
+      }
+
+      if(url.pathname==='/api/native-knowledge/index-health'){
+        try{return sendJson(res,{...knowledgeIndexHealth(),backend:'native-knowledge-index-health'});}
+        catch(e:any){return sendJson(res,{error:e?.message||'Unknown error'},500);}
+      }
+
+      if(url.pathname==='/api/native-knowledge/repair-index'){
+        try{return sendJson(res,{...repairKnowledgeFts(),backend:'native-knowledge-repair-index'});}
+        catch(e:any){return sendJson(res,{error:e?.message||'Unknown error'},500);}
+      }
+
+      if(url.pathname==='/api/native-knowledge/sync'){
+        try{
+          const srcRoot=path.resolve(process.cwd(),'src');
+          // Ghost-file autophagy
+          const activeFiles=new Set<string>();
+          const walk=(dir:string)=>{
+            try{const entries=fs.readdirSync(dir,{withFileTypes:true});for(const e of entries){const full=path.join(dir,e.name);if(e.isDirectory()){if(!['node_modules','dist','build','.git','.next','.cache','out','coverage','audit'].includes(e.name))walk(full);}else{activeFiles.add(path.relative(process.cwd(),full).replace(/\\/g,'/')); }}}catch{}
+          };
+          walk(srcRoot);
+          const conn=(globalThis as any).__knowledgeDbRef;
+          let deleted=0;
+          if(conn){
+            const ingested=conn.prepare(`SELECT DISTINCT SUBSTR(ref, 1, CASE WHEN INSTR(ref, '#') > 0 THEN INSTR(ref, '#') - 1 ELSE LENGTH(ref) END) AS baseFile FROM knowledge WHERE kind = 'ingest'`).all() as {baseFile:string}[];
+            conn.exec('BEGIN IMMEDIATE');
+            const stmt=conn.prepare(`DELETE FROM knowledge WHERE (kind = 'ingest') AND ref LIKE ?`);
+            for(const {baseFile} of ingested){if(!activeFiles.has(baseFile)){stmt.run(`${baseFile}%`);deleted++;}}
+            conn.exec('COMMIT');
+          }
+          emitRuntimeEvent('autophagy.sync',{deleted});
+          return sendJson(res,{deleted,backend:'native-autophagy',message:`Purged ${deleted} ghost chunks`});
+        }catch(e:any){return sendJson(res,{error:e?.message||'Unknown error'},500);}
+      }
+
+      // Maintenance
+      if(url.pathname==='/api/native-maintenance/stats'){
+        try{return sendJson(res,{...getMaintenanceStats(),backend:'native-maintenance-plane'});}
+        catch(e:any){return sendJson(res,{error:e?.message||'Unknown error'},500);}
+      }
+
+      if(url.pathname==='/api/native-maintenance/run'){
+        const dryRun=url.searchParams.get('dryRun')!=='false';
+        try{
+          const stats=getMaintenanceStats();
+          if(!dryRun){
+            const conn=(globalThis as any).__knowledgeDbRef;
+            if(conn){
+              try{conn.exec(`PRAGMA wal_checkpoint(PASSIVE)`);}catch{}
+              try{conn.exec(`PRAGMA optimize`);}catch{}
+            }
+          }
+          return sendJson(res,{dryRun,stats,backend:'native-maintenance-plane'});
+        }catch(e:any){return sendJson(res,{error:e?.message||'Unknown error'},500);}
+      }
+
+      // Scratchpad
+      if(url.pathname==='/api/native-scratchpad/get'){
+        const key=url.searchParams.get('key')||''; if(!key) return sendJson(res,{error:'Missing key'},400);
+        return sendJson(res,{entry:getScratchpad(key)});
+      }
+      if(url.pathname==='/api/native-scratchpad/set'){
+        const key=url.searchParams.get('key')||''; const value=url.searchParams.get('value')||'';
+        if(!key) return sendJson(res,{error:'Missing key'},400);
+        setScratchpad(key,value); return sendJson(res,{success:true});
+      }
+      if(url.pathname==='/api/native-scratchpad/delete'){
+        const key=url.searchParams.get('key')||''; if(!key) return sendJson(res,{error:'Missing key'},400);
+        deleteScratchpad(key); return sendJson(res,{success:true});
+      }
+      if(url.pathname==='/api/native-scratchpad/list'){return sendJson(res,{keys:listScratchpadKeys()});}
+
+      // SSE event bus
+      if(url.pathname==='/api/native-events'){
+        res.statusCode=200;
+        res.setHeader('Content-Type','text/event-stream; charset=utf-8');
+        res.setHeader('Cache-Control','no-cache, no-store');
+        res.setHeader('Connection','keep-alive');
+        res.setHeader('X-Accel-Buffering','no');
+        res.write(`event: connected\ndata: ${JSON.stringify({ts:Date.now(),subscribers:sseSubscribers.size+1,heartbeatMs:25_000})}\n\n`);
+        sseSubscribers.add(res);
+        req.on('close',()=>{sseSubscribers.delete(res);});
+        req.on('error',()=>{sseSubscribers.delete(res);});
+        return;
+      }
+
+      // Runtime
+      if(url.pathname==='/api/native-runtime/stats'){return sendJson(res,{...getRuntimeStats(),backend:'native-runtime-plane'});}
+      if(url.pathname==='/api/native-runtime/events'){
+        const limit=Number(url.searchParams.get('limit')||'100'); const type=url.searchParams.get('type')||undefined;
+        return sendJson(res,{events:listRuntimeEvents({limit,type}),backend:'native-runtime-plane'});
+      }
+
+      // Policy
+      if(url.pathname==='/api/native-policy'){
+        try{return sendJson(res,{...describePolicy({pressure:getRuntimeStats().pressure,engineHealth:getEngineHealth(),selfTestCriticalFailed:(globalThis as any).__nativeSelfTestSummary?.criticalFailed||0}),backend:'native-policy-plane'});}
+        catch(e:any){return sendJson(res,{error:e?.message||'Unknown error'},500);}
+      }
+      if(url.pathname==='/api/native-policy/set'){
+        const key=url.searchParams.get('key') as any; const value=url.searchParams.get('value');
+        if(!key||value==null) return sendJson(res,{error:'Missing key or value'},400);
+        const parsed=value==='true'?true:value==='false'?false:value;
+        try{const ok=setPolicyOverride(key,parsed);return sendJson(res,{ok,key,value:parsed,backend:'native-policy-plane'},ok?200:500);}
+        catch(e:any){return sendJson(res,{error:e?.message||'Unknown error'},500);}
+      }
+      if(url.pathname==='/api/native-policy/clear'){
+        const key=url.searchParams.get('key') as any; if(!key) return sendJson(res,{error:'Missing key'},400);
+        try{const ok=clearPolicyOverride(key);return sendJson(res,{ok,key,backend:'native-policy-plane'},ok?200:500);}
+        catch(e:any){return sendJson(res,{error:e?.message||'Unknown error'},500);}
+      }
+
+      // Replay
+      if(url.pathname==='/api/native-replay/list'){
+        try{const limit=Number(url.searchParams.get('limit')||'50');const route=url.searchParams.get('route')||undefined;return sendJson(res,{entries:listReplays(limit,route),backend:'native-replay-plane'});}
+        catch(e:any){return sendJson(res,{error:e?.message||'Unknown error'},500);}
+      }
+      if(url.pathname==='/api/native-replay/get'){
+        const id=Number(url.searchParams.get('id')||'0'); if(!id) return sendJson(res,{error:'Missing id'},400);
+        try{const entry=getReplay(id);if(!entry) return sendJson(res,{error:'Replay entry not found'},404);return sendJson(res,{entry,request:JSON.parse(entry.requestJson),response:JSON.parse(entry.responseJson),backend:'native-replay-plane'});}
+        catch(e:any){return sendJson(res,{error:e?.message||'Unknown error'},500);}
+      }
+      if(url.pathname==='/api/native-replay/run'){
+        const id=Number(url.searchParams.get('id')||'0'); if(!id) return sendJson(res,{error:'Missing id'},400);
+        try{
+          const entry=getReplay(id); if(!entry) return sendJson(res,{error:'Replay entry not found'},404);
+          const reqBody=JSON.parse(entry.requestJson); const storedRes=JSON.parse(entry.responseJson);
+          let current: any=null;
+          if(entry.route==='/api/native-search'){
+            const q=normQ(String(reqBody.q||'')); const c=clamp(Number(reqBody.count||'8'));
+            if(!q) return sendJson(res,{error:'Stored replay has no query'},400);
+            const recalled=queryKnowledge(q,5)||[];
+            const {results,cs}=await metasearch(q,c);
+            current={results:kbAnnotate(results),recalled,cache_hit:cs!=='miss',cache_state:cs,backend:'native-metasearch-rrf'};
+          }else if(entry.route==='/api/native-read'){
+            const tu=String(reqBody.url||''); if(!tu) return sendJson(res,{error:'Stored replay has no url'},400);
+            const html=await nodeFetch(tu); let text=extractMain(html).slice(0,MAX_READ_CHARS);
+            if(reqBody.redact) text=redactPII(text);
+            current={text,tier:'fast_static'};
+          }else{return sendJson(res,{error:'Replay only supports native-search and native-read',route:entry.route},400);}
+          return sendJson(res,{route:entry.route,stored:storedRes,current,diff:summarizeReplayDiff(storedRes,current),backend:'native-replay-plane'});
+        }catch(e:any){return sendJson(res,{error:e?.message||'Unknown error'},500);}
+      }
+
+      // Snapshot
+      if(url.pathname==='/api/native-snapshot/manifest'){try{return sendJson(res,{...getSnapshotManifest(),backend:'native-snapshot-plane'});}catch(e:any){return sendJson(res,{error:e?.message||'Unknown error'},500);}}
+      if(url.pathname==='/api/native-snapshot/list'){try{const limit=Number(url.searchParams.get('limit')||'50');return sendJson(res,{backups:listHotBackups(limit),backend:'native-snapshot-plane'});}catch(e:any){return sendJson(res,{error:e?.message||'Unknown error'},500);}}
+      if(url.pathname==='/api/native-snapshot/backup'){try{const label=url.searchParams.get('label')||undefined;const result=await createHotBackup(label);return sendJson(res,{...result,backend:'native-snapshot-plane'},result.ok?200:500);}catch(e:any){return sendJson(res,{error:e?.message||'Unknown error'},500);}}
+
+      // Foresight plane
+      if(url.pathname==='/api/native-foresight/blast-radius'){
+        const ref=url.searchParams.get('ref')||''; if(!ref) return sendJson(res,{error:'Missing ref'},400);
+        try{return sendJson(res,{ref,blast_radius:getBlastRadius(ref),backend:'native-foresight-plane'});}
+        catch(e:any){return sendJson(res,{error:e?.message||'Unknown error'},500);}
+      }
+      if(url.pathname==='/api/native-foresight/simulate'){
+        try{
+          let bodyStr='';
+          for await(const chunk of req){bodyStr+=chunk;if(bodyStr.length>5*1024*1024)throw new Error('Payload too large');}
+          const payload=JSON.parse(bodyStr);
+          if(!payload.ref||!payload.content) return sendJson(res,{error:'Missing ref or content in JSON body'},400);
+          // Simulate edit impact
+          const injScan=scanForInjection(payload.content.slice(0,50_000));
+          const securityFlags=injScan.clean?[]:injScan.patterns;
+          const blast_radius=getBlastRadius(payload.ref);
+          // Extract imports and check against graph
+          const IMPORT_RE=/(?:import\s+(?:[\w*{}\s,]+\s+from\s+)?|require\()\s*['"]([^'"]+)['"]/g;
+          const danglingImports: string[]=[];
+          let m; IMPORT_RE.lastIndex=0;
+          while((m=IMPORT_RE.exec(payload.content))!==null){
+            if(!m[1].startsWith('.')) continue;
+            const name=m[1].replace(/^\.\/|^\.\.\//,'');
+            const deps=getDependencies(payload.ref,50);
+            if(!deps.some(d=>d.toRef.includes(name))) danglingImports.push(m[1]);
+          }
+          return sendJson(res,{ref:payload.ref,simulation:{safe:securityFlags.length===0&&danglingImports.length===0,blast_radius,securityFlags,danglingImports},backend:'native-foresight-plane'});
+        }catch(e:any){return sendJson(res,{error:e?.message||'Simulation failed'},500);}
+      }
+
+      // Self-test + chaos + contract + doctor + help
+      if(url.pathname==='/api/native-selftest'){
+        try{
+          const r=await runNativeSelfTest();
+          (globalThis as any).__nativeSelfTestSummary=r.summary;
+          try{applySelfTestRemediation(r);}catch{}
+          return sendJson(res,{...r,backend:'native-selftest'});
+        }catch(e:any){return sendJson(res,{error:e?.message||'Self-test failed'},500);}
+      }
+
+      if(url.pathname==='/api/native-selftest/functional'){
+        try{const rw=url.searchParams.get('rw')==='true';return sendJson(res,{...await runFunctionalSelfTest({rw}),backend:'native-selftest-functional'});}
+        catch(e:any){return sendJson(res,{error:e?.message||'Functional self-test failed'},500);}
+      }
+
+      if(url.pathname==='/api/native-chaos'){
+        try{
+          const seed=Number(url.searchParams.get('seed')||'195936478'); const iterations=Number(url.searchParams.get('iterations')||'128');
+          return sendJson(res,await runNativeChaosHarness({seed,iterations,root:process.cwd(),validateUrl:async(candidate:string)=>prepTarget(candidate),redactSecrets}));
+        }catch(e:any){return sendJson(res,{error:e?.message||'Chaos harness failed'},500);}
+      }
+
+      if(url.pathname==='/api/native-openapi.json'){
+        try{const proto=req.headers['x-forwarded-proto']||'http';const host=req.headers.host||'localhost:5173';return sendJson(res,getNativeOpenApiDocument(`${proto}://${host}`));}
+        catch(e:any){return sendJson(res,{error:e?.message||'Unknown error'},500);}
+      }
+
+      if(url.pathname==='/api/native-problems'){try{return sendJson(res,getProblemCatalog());}catch(e:any){return sendJson(res,{error:e?.message||'Unknown error'},500);}}
+
+      if(url.pathname==='/api/native-contract/selftest'){try{return sendJson(res,{...contractSelfTest(),backend:'native-contract-plane'});}catch(e:any){return sendJson(res,{error:e?.message||'Unknown error'},500);}}
+
+      if(url.pathname==='/api/native-doctor'){
+        try{const deep=url.searchParams.get('deep')==='true';return sendJson(res,{...await buildDoctorReport({deep}),backend:'native-doctor-plane'});}
+        catch(e:any){return sendJson(res,{error:e?.message||'Doctor report failed'},500);}
+      }
+
+      if(url.pathname==='/api/native-help'){
+        return sendJson(res,{name:'PrismaReact Native Scraper & Knowledge Gateway',version:'terminal',machine_contract:{openapi:'/api/native-openapi.json',problems:'/api/native-problems',selftest:'/api/native-contract/selftest',doctor:'/api/native-doctor'},quickstart:{search:'/api/native-search?q=your+query',read:'/api/native-read?url=https://example.com',doctor:'/api/native-doctor?deep=true',selftest:'/api/native-selftest'}});
+      }
+
+      // Audit
+      if(url.pathname==='/api/audit/verify'){try{return sendJson(res,await verifyLedger());}catch(e:any){return sendJson(res,{error:e?.message||'Unknown error'},500);}}
+
+      return next();
+    }).catch(err=>{
+      console.error('[Vite Native Scraper Async Error]',err);
+      if(!res.headersSent) return sendJson(res,{error:err?.message||'Internal Server Error'},500);
+      return next(err);
+    });
+  });
+}
+
+export function nativeScraperPlugin(): Plugin {
+  let stopWatcher: (()=>void)|null=null;
+  return {
+    name:'vite-native-scraper',
+    configureServer(server){
+      attachRoutes(server.middlewares);
+      const srcRoot=path.resolve(process.cwd(),'src');
+      stopWatcher=startAutoRag(srcRoot);
+      console.log(`[Auto-RAG] Watching ${srcRoot} (zstd=${zstdSupported?'on':'off'})`);
+      server.httpServer?.on('close',()=>{stopWatcher?.();stopWatcher=null;});
+
+      // Boot-time tasks
+      setTimeout(()=>{
+        runNativeSelfTest().then(r=>{
+          (globalThis as any).__nativeSelfTestSummary=r.summary;
+          try{applySelfTestRemediation(r);}catch{}
+          if(!r.ok) console.warn('[SelfTest] CRITICAL failures:',r.summary);
+          else console.log(`[SelfTest] All ${r.summary.total} checks passed.`);
+        }).catch(()=>{});
+      },1500).unref?.();
+
+      setTimeout(()=>{
+        buildDoctorReport({deep:false}).then(r=>
+          console.log(`[Doctor] ${r.status} | critical=${r.summary.criticalFailed} | pressure=${r.summary.runtimePressure}`)
+        ).catch(()=>{});
+      },2000).unref?.();
+
+      setTimeout(()=>{
+        try{compactKnowledgeStore(3);}catch{}
+        try{const h=knowledgeIndexHealth();if(h.available&&h.ftsEnabled&&!h.consistent)repairKnowledgeFts();}catch{}
+      },8000).unref?.();
+    },
+    configurePreviewServer(server){ attachRoutes(server.middlewares); },
+  };
+}
+
+// Export types for use in other modules
+export type { SR as SearchResult };
+interface KnowledgeEntry { kind: KnowledgeKind; ref: string; summary: string; }
+type KnowledgeKind = 'search' | 'read' | 'ingest';
+```
+
+---
+
+
